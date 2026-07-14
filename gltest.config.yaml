@@ -1,0 +1,25 @@
+# GenLayer test configuration for gen-escrow
+#
+# Smart Escrow with AI-powered dispute resolution.
+#
+# Default: localnet (GLSim). For real LLM + consensus use studionet (gasless).
+#
+# Usage:
+#   pytest tests/direct/ -v
+#   gltest tests/integration/ -v -s
+#   gltest tests/integration/ -v -s --network studionet
+#
+# studionet (studio.genlayer.com) is gasless and ships a built-in LLM.
+
+paths:
+  contracts: contracts/
+
+networks:
+  default: localnet
+
+  localnet: {}
+  studionet: {}
+
+  # testnet_bradbury:
+  #   accounts:
+  #     - "${ACCOUNT_PRIVATE_KEY_1}"
