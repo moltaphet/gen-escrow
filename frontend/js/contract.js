@@ -58,9 +58,12 @@ function getWriteClient() {
   });
 }
 
-// Submit a write and wait until it FINALIZES so subsequent reads (balances,
-// escrow state, claimable) reflect the settled result. Native value transfers
-// on GenLayer only settle at FINALIZED, not ACCEPTED.
+// Submit a write and wait until it is ACCEPTED before returning, so the
+// contract-state reads this UI performs (escrow status, claimable) reflect the
+// change on the next refresh. ACCEPTED is sufficient here because the UI reads
+// contract storage, not native EOA balances (those settle at FINALIZED). The
+// SDK's default wait budget is short (~30s), so we widen it to tolerate slower
+// StudioNet rounds instead of silently giving up.
 async function submitWrite(client, functionName, kwargs, value = 0n) {
   const txHash = await client.writeContract({
     address: CONTRACT_ADDRESS,
@@ -69,11 +72,17 @@ async function submitWrite(client, functionName, kwargs, value = 0n) {
     value,
   });
   try {
-    return await client.waitForTransactionReceipt({ hash: txHash, status: "FINALIZED" });
+    return await client.waitForTransactionReceipt({
+      hash: txHash,
+      status: "ACCEPTED",
+      interval: 3000,
+      retries: 40,
+    });
   } catch (e) {
-    // Fall back to returning the hash if receipt polling is unavailable.
+    // The transaction was already submitted; only the wait failed. Surface it
+    // so callers do not report a premature success, but keep the hash for logs.
     console.warn("[gen-escrow] waitForTransactionReceipt failed", e);
-    return txHash;
+    throw new Error("Transaction submitted but confirmation timed out: " + (e.message || e));
   }
 }
 
