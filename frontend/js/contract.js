@@ -49,7 +49,32 @@ function getReadClient() {
 function getWriteClient() {
   if (!sdkReady) throw new Error("genlayer-js not loaded");
   if (!STATE.account) throw new Error("Wallet not connected");
-  return GL.createClient({ chain: chain(), account: STATE.account });
+  // Pass the injected wallet provider so genlayer-js signs writes through
+  // MetaMask, and the connected address as the account.
+  return GL.createClient({
+    chain: chain(),
+    account: STATE.account,
+    provider: (typeof window !== "undefined" && window.ethereum) || undefined,
+  });
+}
+
+// Submit a write and wait until it FINALIZES so subsequent reads (balances,
+// escrow state, claimable) reflect the settled result. Native value transfers
+// on GenLayer only settle at FINALIZED, not ACCEPTED.
+async function submitWrite(client, functionName, kwargs, value = 0n) {
+  const txHash = await client.writeContract({
+    address: CONTRACT_ADDRESS,
+    functionName,
+    kwargs,
+    value,
+  });
+  try {
+    return await client.waitForTransactionReceipt({ hash: txHash, status: "FINALIZED" });
+  } catch (e) {
+    // Fall back to returning the hash if receipt polling is unavailable.
+    console.warn("[gen-escrow] waitForTransactionReceipt failed", e);
+    return txHash;
+  }
 }
 
 /* ---------- Address helpers ---------- */
@@ -77,30 +102,31 @@ function big(v) {
 export async function getStats() {
   if (!hasContract()) throw new Error("Contract address not set");
   const client = getReadClient();
-  const contract = client.getContract({ address: CONTRACT_ADDRESS });
-  const res = await contract.view().get_stats().call();
+  const res = await client.readContract({ address: CONTRACT_ADDRESS, functionName: "get_stats", args: [] });
   return asObj(res);
 }
 
 export async function getEscrow(id) {
   const client = getReadClient();
-  const contract = client.getContract({ address: CONTRACT_ADDRESS });
-  const res = await contract.view().get_escrow({ escrow_id: id }).call();
+  const res = await client.readContract({
+    address: CONTRACT_ADDRESS,
+    functionName: "get_escrow",
+    kwargs: { escrow_id: Number(id) },
+  });
   return asObj(res);
 }
 
 export async function getMyEscrows(account, role = "all") {
   const client = getReadClient();
-  const contract = client.getContract({ address: CONTRACT_ADDRESS });
 
   // Fetch role id-lists concurrently. Use allSettled so a single failed read
   // (e.g. seller index) never wipes the other role's results.
   const roleReads = [];
   if (role === "buyer" || role === "all") {
-    roleReads.push(contract.view().get_escrows_by_buyer({ buyer: account }).call());
+    roleReads.push(client.readContract({ address: CONTRACT_ADDRESS, functionName: "get_escrows_by_buyer", kwargs: { buyer: account } }));
   }
   if (role === "seller" || role === "all") {
-    roleReads.push(contract.view().get_escrows_by_seller({ seller: account }).call());
+    roleReads.push(client.readContract({ address: CONTRACT_ADDRESS, functionName: "get_escrows_by_seller", kwargs: { seller: account } }));
   }
 
   let ids = [];
@@ -123,8 +149,11 @@ export async function getMyEscrows(account, role = "all") {
 
 export async function getClaimable(account) {
   const client = getReadClient();
-  const contract = client.getContract({ address: CONTRACT_ADDRESS });
-  const val = await contract.view().get_claimable({ addr: account }).call();
+  const val = await client.readContract({
+    address: CONTRACT_ADDRESS,
+    functionName: "get_claimable",
+    kwargs: { addr: account },
+  });
   return big(val);
 }
 
@@ -135,62 +164,54 @@ export async function getClaimable(account) {
 export async function createEscrow({ seller, amountGen, title, description, terms, deadline }) {
   if (!hasContract()) throw new Error("Contract address not configured");
   const client = getWriteClient();
-  const contract = client.getContract({ address: CONTRACT_ADDRESS });
-
   const amountAtto = genToAtto(amountGen);
 
-  const receipt = await contract
-    .write()
-    .create_escrow({
+  return submitWrite(
+    client,
+    "create_escrow",
+    {
       seller,
       title,
       description: description || "",
       terms,
       deadline_iso: deadline || "",
-    })
-    .transact({ value: amountAtto });
-
-  return receipt;
+    },
+    amountAtto,
+  );
 }
 
 export async function release(escrowId) {
   const client = getWriteClient();
-  const contract = client.getContract({ address: CONTRACT_ADDRESS });
-  return contract.write().release({ escrow_id: Number(escrowId) }).transact();
+  return submitWrite(client, "release", { escrow_id: Number(escrowId) });
 }
 
 export async function refund(escrowId) {
   const client = getWriteClient();
-  const contract = client.getContract({ address: CONTRACT_ADDRESS });
-  return contract.write().refund({ escrow_id: Number(escrowId) }).transact();
+  return submitWrite(client, "refund", { escrow_id: Number(escrowId) });
 }
 
 export async function raiseDispute(escrowId, reason, evidence) {
   const client = getWriteClient();
-  const contract = client.getContract({ address: CONTRACT_ADDRESS });
-  return contract.write().raise_dispute({
+  return submitWrite(client, "raise_dispute", {
     escrow_id: Number(escrowId),
     reason,
     evidence: evidence || "",
-  }).transact();
+  });
 }
 
 export async function resolveDispute(escrowId) {
   const client = getWriteClient();
-  const contract = client.getContract({ address: CONTRACT_ADDRESS });
-  return contract.write().resolve_dispute({ escrow_id: Number(escrowId) }).transact();
+  return submitWrite(client, "resolve_dispute", { escrow_id: Number(escrowId) });
 }
 
 export async function claimAfterDeadline(escrowId) {
   const client = getWriteClient();
-  const contract = client.getContract({ address: CONTRACT_ADDRESS });
-  return contract.write().claim_after_deadline({ escrow_id: Number(escrowId) }).transact();
+  return submitWrite(client, "claim_after_deadline", { escrow_id: Number(escrowId) });
 }
 
 export async function claim() {
   const client = getWriteClient();
-  const contract = client.getContract({ address: CONTRACT_ADDRESS });
-  return contract.write().claim({}).transact();
+  return submitWrite(client, "claim", {});
 }
 
 /* ============================================================
