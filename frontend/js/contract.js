@@ -189,6 +189,15 @@ export async function createEscrow({ seller, amountGen, title, description, term
   );
 }
 
+export async function submitDelivery(escrowId, note, evidence) {
+  const client = getWriteClient();
+  return submitWrite(client, "submit_delivery", {
+    escrow_id: Number(escrowId),
+    note,
+    evidence: evidence || "",
+  });
+}
+
 export async function release(escrowId) {
   const client = getWriteClient();
   return submitWrite(client, "release", { escrow_id: Number(escrowId) });

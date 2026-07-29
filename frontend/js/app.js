@@ -103,6 +103,21 @@ function openEscrowDetail(esc) {
         UI.showToast("Release failed: " + (err.message || err), "err");
       }
     },
+    submitDelivery: async (id) => {
+      const note = prompt("Describe what you delivered (deliverables, scope covered):");
+      if (!note) return;
+      const evidence = prompt("Add delivery evidence or links (optional)", "") || "";
+      if (!canWrite()) return alert("Connect wallet and switch to StudioNet");
+      try {
+        UI.showToast("Submitting delivery...", "ok");
+        await C.submitDelivery(id, note, evidence);
+        UI.showToast("Delivery submitted. Refreshing...", "ok");
+        UI.closeModal();
+        await refreshAll();
+      } catch (err) {
+        UI.showToast("Submit delivery failed: " + (err.message || err), "err");
+      }
+    },
     refund: async (id) => {
       if (!canWrite()) return alert("Connect wallet and switch to StudioNet");
       try {

@@ -2,8 +2,8 @@
 Full-lifecycle integration tests for gen-escrow against real GenLayer consensus.
 
 Covers every write method:
-  create_escrow, release, refund, raise_dispute, resolve_dispute,
-  claim_after_deadline, claim, set_paused, withdraw_fees.
+  create_escrow, submit_delivery, release, refund, raise_dispute,
+  resolve_dispute, claim_after_deadline, claim, set_paused, withdraw_fees.
 
 Value movement is verified with live on-chain balances (contract + EOA) so we
 prove funds actually move and nothing is stranded. Consensus receipts are
@@ -106,6 +106,45 @@ def test_release_then_claim_pays_seller_and_drains_escrow():
     )
     # No double claim
     assert int(contract.get_claimable(args=[seller.address]).call()) == 0
+
+
+def test_submit_delivery_then_release_pays_seller():
+    """Full lifecycle through the new delivery step:
+    create -> submit_delivery -> release -> claim, with value movement checks."""
+    buyer, seller = _parties()
+    contract = _fresh()
+
+    tx = contract.connect(buyer).create_escrow(
+        args=[seller.address, "Delivered job", "d", "Deliver final assets for review", "2026-08-01"]
+    ).transact(value=ONE_GEN)
+    assert tx_execution_succeeded(tx)
+
+    # Seller records the deliverables on-chain -> DELIVERY_SUBMITTED
+    tx = contract.connect(seller).submit_delivery(
+        args=[1, "Delivered all final assets and exports", "https://example.com/delivery"]
+    ).transact()
+    assert tx_execution_succeeded(tx)
+    print("\n[submit_delivery] consensus:", assert_real_consensus(tx))
+    esc = contract.get_escrow(args=[1]).call()
+    assert esc["status"] == "DELIVERY_SUBMITTED"
+    assert "Delivered all final assets" in esc["delivery_note"]
+
+    seller_before = balance(seller.address)
+
+    # Buyer reviews the delivery and releases
+    tx = contract.connect(buyer).release(args=[1]).transact()
+    assert tx_execution_succeeded(tx)
+    esc = contract.get_escrow(args=[1]).call()
+    assert esc["status"] == "COMPLETED"
+    assert int(contract.get_claimable(args=[seller.address]).call()) == net_of(ONE_GEN)
+
+    # Seller pulls the payment; native transfer settles on FINALIZED.
+    tx = _claim_finalized(contract.connect(seller))
+    assert tx_execution_succeeded(tx)
+    seller_after = balance(seller.address)
+    assert seller_after - seller_before == net_of(ONE_GEN), (
+        f"seller EOA did not receive net after delivery+release: {seller_before}->{seller_after}"
+    )
 
 
 def test_refund_returns_value_to_buyer():
