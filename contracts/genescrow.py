@@ -17,8 +17,11 @@ Features:
 - Pull-payment pattern for all payouts (claimable balances)
 
 Status machine:
-  FUNDED -> COMPLETED (full release)
-         -> REFUNDED (full refund)
+  FUNDED -> DELIVERY_SUBMITTED (seller records deliverables for buyer review)
+         -> REFUNDED (buyer refunds before any delivery)
+
+  FUNDED | DELIVERY_SUBMITTED
+         -> COMPLETED (buyer releases funds)
          -> DISPUTED -> RESOLVED (AI decides split or winner)
          -> EXPIRED (seller claims after deadline with no dispute)
 
@@ -46,8 +49,13 @@ MAX_TEXT_LEN = 4000               # safety cap for LLM input
 PLATFORM_FEE_BPS = 50             # 0.50% on successful release (optional, can be 0)
 VALID_WINNERS = ("BUYER", "SELLER", "SPLIT")
 
+# The canonical null address. Crediting or paying out to this address would
+# permanently burn funds, so it is rejected wherever a payout target is set.
+ZERO_ADDRESS_HEX = "0x0000000000000000000000000000000000000000"
+
 # Status values (strings for readability + easy frontend mapping)
 STATUS_FUNDED = "FUNDED"
+STATUS_DELIVERY_SUBMITTED = "DELIVERY_SUBMITTED"
 STATUS_COMPLETED = "COMPLETED"
 STATUS_REFUNDED = "REFUNDED"
 STATUS_DISPUTED = "DISPUTED"
@@ -144,6 +152,11 @@ def _addr_hex(addr: Address) -> str:
     return str(addr)
 
 
+def _is_zero_address(addr: Address) -> bool:
+    """True if the address is the null address (funds sent here are burned)."""
+    return _addr_hex(addr).lower() == ZERO_ADDRESS_HEX
+
+
 # ===========================================================================
 # Storage model - flat, append-only friendly
 # ===========================================================================
@@ -165,6 +178,11 @@ class Escrow:
     status: str
     created_at: str
     funded_at: str
+
+    # Delivery data (populated by seller via submit_delivery)
+    delivery_note: str         # seller's description of what was delivered
+    delivery_evidence: str     # links / proof of delivery
+    delivery_submitted_at: str
 
     # Dispute data
     dispute_raised_by: Address
@@ -208,6 +226,9 @@ def _serialize_escrow(esc: Escrow) -> str:
         "status": esc.status,
         "created_at": esc.created_at,
         "funded_at": esc.funded_at,
+        "delivery_note": esc.delivery_note,
+        "delivery_evidence": esc.delivery_evidence,
+        "delivery_submitted_at": esc.delivery_submitted_at,
         "dispute_raised_by": str(esc.dispute_raised_by) if esc.dispute_raised_by else "",
         "dispute_reason": esc.dispute_reason,
         "dispute_evidence": esc.dispute_evidence,
@@ -238,7 +259,10 @@ def _deserialize_escrow(data: str) -> Escrow:
         status=d["status"],
         created_at=d["created_at"],
         funded_at=d["funded_at"],
-        dispute_raised_by=Address(d["dispute_raised_by"]) if d["dispute_raised_by"] else Address("0x0000000000000000000000000000000000000000"),
+        delivery_note=d.get("delivery_note", ""),
+        delivery_evidence=d.get("delivery_evidence", ""),
+        delivery_submitted_at=d.get("delivery_submitted_at", ""),
+        dispute_raised_by=Address(d["dispute_raised_by"]) if d["dispute_raised_by"] else Address(ZERO_ADDRESS_HEX),
         dispute_reason=d["dispute_reason"],
         dispute_evidence=d["dispute_evidence"],
         dispute_raised_at=d["dispute_raised_at"],
@@ -350,6 +374,9 @@ class GenEscrow(gl.Contract):
             "status": esc.status,
             "created_at": esc.created_at,
             "funded_at": esc.funded_at,
+            "delivery_note": esc.delivery_note,
+            "delivery_evidence": esc.delivery_evidence,
+            "delivery_submitted_at": esc.delivery_submitted_at,
             "dispute_raised_by": str(esc.dispute_raised_by) if esc.dispute_raised_by else "",
             "dispute_reason": esc.dispute_reason,
             "dispute_evidence": esc.dispute_evidence,
@@ -436,6 +463,10 @@ class GenEscrow(gl.Contract):
                 raise gl.vm.UserError(f"{ERROR_EXPECTED} Seller must be a valid address (got {s!r})")
             seller_addr = Address(s)
 
+        # Reject the null address: any funds later released to it would be burned.
+        if _is_zero_address(seller_addr):
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} Seller cannot be the zero address")
+
         if seller_addr == sender:
             raise gl.vm.UserError(f"{ERROR_EXPECTED} Buyer and seller cannot be the same")
 
@@ -473,7 +504,10 @@ class GenEscrow(gl.Contract):
             status=STATUS_FUNDED,
             created_at=now,
             funded_at=now,
-            dispute_raised_by=Address("0x0000000000000000000000000000000000000000"),
+            delivery_note="",
+            delivery_evidence="",
+            delivery_submitted_at="",
+            dispute_raised_by=Address(ZERO_ADDRESS_HEX),
             dispute_reason="",
             dispute_evidence="",
             dispute_raised_at="",
@@ -498,6 +532,43 @@ class GenEscrow(gl.Contract):
         return int(eid)
 
     # ------------------------------------------------------------------
+    # Write: Seller records delivery for buyer review
+    # ------------------------------------------------------------------
+    @gl.public.write
+    def submit_delivery(self, escrow_id: int, note: str, evidence: str) -> None:
+        """
+        Seller records the deliverables on-chain so the buyer can review them
+        before releasing funds. This closes the lifecycle gap where an escrow
+        could jump straight from FUNDED to DISPUTED with nothing delivered.
+
+        Only the seller may call this, and only while the escrow is still
+        FUNDED (delivery is submitted exactly once). The resulting
+        DELIVERY_SUBMITTED state is the review window for the buyer.
+        """
+        self._require_not_paused()
+        esc = self._require_escrow(escrow_id)
+
+        if gl.message.sender_address != esc.seller:
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} Only seller can submit delivery")
+
+        # FUNDED only: prevents overwriting a delivery after a dispute/resolution
+        # and enforces a single, reviewable submission.
+        self._require_status(esc, [STATUS_FUNDED])
+
+        note = _safe_text(note, 800).strip()
+        evidence = _safe_text(evidence, 1400).strip()
+
+        if len(note) < 5:
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} Delivery note must describe what was delivered")
+
+        esc.delivery_note = note
+        esc.delivery_evidence = evidence
+        esc.delivery_submitted_at = _now_iso()
+        esc.status = STATUS_DELIVERY_SUBMITTED
+
+        self.escrows[u256(escrow_id)] = _serialize_escrow(esc)
+
+    # ------------------------------------------------------------------
     # Write: Buyer releases funds (happy path, no dispute)
     # ------------------------------------------------------------------
     @gl.public.write
@@ -509,7 +580,9 @@ class GenEscrow(gl.Contract):
         if gl.message.sender_address != esc.buyer:
             raise gl.vm.UserError(f"{ERROR_EXPECTED} Only buyer can release")
 
-        self._require_status(esc, [STATUS_FUNDED])
+        # Buyer may release straight from FUNDED (early acceptance) or after the
+        # seller has submitted delivery for review.
+        self._require_status(esc, [STATUS_FUNDED, STATUS_DELIVERY_SUBMITTED])
 
         # Credit seller the full net amount (fees stay in contract until owner withdraws)
         self._credit(esc.seller, esc.net_amount_atto)
@@ -558,7 +631,9 @@ class GenEscrow(gl.Contract):
         if not self._is_buyer_or_seller(esc):
             raise gl.vm.UserError(f"{ERROR_EXPECTED} Only buyer or seller may raise dispute")
 
-        self._require_status(esc, [STATUS_FUNDED, STATUS_DISPUTED])  # allow re-statement?
+        # Either party may dispute before delivery (FUNDED), during buyer review
+        # (DELIVERY_SUBMITTED), or re-state an existing dispute (DISPUTED).
+        self._require_status(esc, [STATUS_FUNDED, STATUS_DELIVERY_SUBMITTED, STATUS_DISPUTED])
 
         reason = _safe_text(reason, 600).strip()
         evidence = _safe_text(evidence, 1400).strip()
@@ -591,6 +666,8 @@ class GenEscrow(gl.Contract):
                 f"TITLE: {esc.title}\n"
                 f"DESCRIPTION: {esc.description}\n"
                 f"RELEASE TERMS / CONDITIONS:\n{esc.terms}\n\n"
+                f"SELLER DELIVERY NOTE:\n{esc.delivery_note}\n"
+                f"SELLER DELIVERY EVIDENCE:\n{esc.delivery_evidence}\n\n"
                 f"DISPUTE RAISED BY: {esc.dispute_raised_by}\n"
                 f"DISPUTE REASON:\n{esc.dispute_reason}\n\n"
                 f"EVIDENCE / LINKS:\n{esc.dispute_evidence}\n\n"
@@ -721,7 +798,9 @@ class GenEscrow(gl.Contract):
         if gl.message.sender_address != esc.seller:
             raise gl.vm.UserError(f"{ERROR_EXPECTED} Only seller can claim after deadline")
 
-        self._require_status(esc, [STATUS_FUNDED])
+        # Seller can time-claim whether or not delivery was formally submitted,
+        # as long as no dispute is open.
+        self._require_status(esc, [STATUS_FUNDED, STATUS_DELIVERY_SUBMITTED])
 
         # NOTE: Deadline enforcement here is best-effort / advisory.
         # Real on-chain time is not available. Frontends + validators
@@ -777,6 +856,9 @@ class GenEscrow(gl.Contract):
         """Owner can withdraw accumulated platform fees."""
         self._only_owner()
         to_addr = Address(to)
+        # Never sweep fees to the null address; that would burn protocol revenue.
+        if _is_zero_address(to_addr):
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} Cannot withdraw to the zero address")
         bal = int(self.platform_fees_collected)
         if bal <= 0:
             raise gl.vm.UserError(f"{ERROR_EXPECTED} No fees to withdraw")

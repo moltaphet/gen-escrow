@@ -101,6 +101,16 @@ export function renderEscrowModal(esc, currentAccount) {
     </div>
   `;
 
+  if (esc.delivery_note) {
+    html += `
+      <div class="modal__row">
+        <div class="modal__label">Delivery</div>
+        <div class="modal__value"><strong>Note:</strong> ${escapeHtml(esc.delivery_note)}</div>
+        ${esc.delivery_evidence ? `<div style="margin-top:6px"><strong>Evidence:</strong><br>${escapeHtml(esc.delivery_evidence)}</div>` : ""}
+      </div>
+    `;
+  }
+
   if (esc.status === "DISPUTED" || esc.status === "RESOLVED") {
     html += `
       <div class="modal__row">
@@ -144,9 +154,18 @@ export function renderModalActions(esc, currentAccount, handlers) {
     container.appendChild(b);
   };
 
-  if (esc.status === "FUNDED") {
+  // Seller records deliverables while the escrow is still FUNDED.
+  if (esc.status === "FUNDED" && isSeller) {
+    addBtn("Submit Delivery", "btn--primary", () => handlers.submitDelivery(esc.id));
+  }
+
+  // Buyer may release from FUNDED (early) or after reviewing a delivery.
+  if (esc.status === "FUNDED" || esc.status === "DELIVERY_SUBMITTED") {
     if (isBuyer) {
       addBtn("Release to Seller", "btn--success", () => handlers.release(esc.id));
+    }
+    // Refund is only available before any delivery has been submitted.
+    if (isBuyer && esc.status === "FUNDED") {
       addBtn("Refund Myself", "btn--ghost", () => handlers.refund(esc.id));
     }
     addBtn("Raise Dispute", "btn--warn", () => handlers.raiseDispute(esc.id));
@@ -159,7 +178,7 @@ export function renderModalActions(esc, currentAccount, handlers) {
     }
   }
 
-  if (esc.status === "FUNDED" && isSeller) {
+  if ((esc.status === "FUNDED" || esc.status === "DELIVERY_SUBMITTED") && isSeller) {
     addBtn("Claim After Deadline", "btn--ghost", () => handlers.claimAfterDeadline(esc.id));
   }
 

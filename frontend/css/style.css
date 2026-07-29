@@ -171,6 +171,7 @@ img { max-width: 100%; display: block; }
   letter-spacing: .5px;
 }
 .status--FUNDED { background: rgba(117,197,222,0.15); color: var(--blue); }
+.status--DELIVERY_SUBMITTED { background: rgba(160,140,220,0.16); color: var(--blue); }
 .status--COMPLETED, .status--RESOLVED { background: rgba(122,217,168,0.15); color: var(--ok); }
 .status--DISPUTED { background: rgba(230,180,90,0.15); color: var(--warn); }
 .status--REFUNDED, .status--EXPIRED { background: rgba(229,115,115,0.12); color: var(--err); }
