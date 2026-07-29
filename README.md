@@ -75,7 +75,7 @@ All monetary values are stored as `u256` in **atto** units (`value × 10^18`).
 
 | | |
 |---|---|
-| **Contract address** | `0x8CF0DbFC4135faC96F8909b2A89747E8707aBaAf` |
+| **Contract address** | `0xF80C4d6b15A3Fd9943223211Aa923D8e09bd31f6` |
 | **Network** | GenLayer StudioNet (`0xF22F` · 61999) |
 | **Explorer / Studio** | https://studio.genlayer.com |
 
