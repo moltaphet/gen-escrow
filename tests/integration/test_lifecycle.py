@@ -164,13 +164,15 @@ def test_refund_returns_value_to_buyer():
     esc = contract.get_escrow(args=[1]).call()
     assert esc["status"] == "REFUNDED"
 
-    assert int(contract.get_claimable(args=[buyer.address]).call()) == net_of(ONE_GEN)
+    # Refund before delivery charges no fee: buyer is made whole with the FULL
+    # gross amount, and nothing is stranded in the contract.
+    assert int(contract.get_claimable(args=[buyer.address]).call()) == ONE_GEN
 
     tx = _claim_finalized(contract.connect(buyer))
     assert tx_execution_succeeded(tx)
     buyer_after = balance(buyer.address)
-    assert buyer_after - buyer_before == net_of(ONE_GEN), (
-        f"buyer EOA not refunded net: {buyer_before}->{buyer_after}"
+    assert buyer_after - buyer_before == ONE_GEN, (
+        f"buyer EOA not refunded in full: {buyer_before}->{buyer_after}"
     )
 
 
