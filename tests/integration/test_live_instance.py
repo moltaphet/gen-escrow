@@ -24,7 +24,7 @@ pytestmark = pytest.mark.skipif(
            "set RUN_LIVE_INSTANCE=1 to run on demand.",
 )
 
-LIVE_ADDRESS = "0xF80C4d6b15A3Fd9943223211Aa923D8e09bd31f6"
+LIVE_ADDRESS = "0x6D94e05527E7F54244eD00EC6ABDfd99599fCF0c"
 ONE_GEN = 10**18
 
 

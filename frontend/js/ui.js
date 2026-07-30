@@ -37,7 +37,6 @@ export function renderStatus(status) {
 export function renderEscrowCard(esc) {
   const id = Number(esc.id);
   const amount = C.formatGEN(esc.net_amount_atto ?? esc.amount_atto);
-  const isBuyer = false; // determined by caller context if needed
 
   return `
     <div class="escrow-card" data-id="${id}">

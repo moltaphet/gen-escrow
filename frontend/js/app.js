@@ -149,7 +149,7 @@ function openEscrowDetail(esc) {
       if (!canWrite()) return alert("Connect wallet and switch to StudioNet");
       try {
         UI.showToast("Submitting to AI consensus (this may take 30–90s)...", "ok");
-        const receipt = await C.resolveDispute(id);
+        await C.resolveDispute(id);
         UI.showToast("Dispute resolved. Refreshing...", "ok");
         UI.closeModal();
         await refreshAll();
