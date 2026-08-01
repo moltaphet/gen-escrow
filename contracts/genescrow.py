@@ -49,6 +49,16 @@ MAX_TEXT_LEN = 4000               # safety cap for LLM input
 PLATFORM_FEE_BPS = 50             # 0.50% on successful release (optional, can be 0)
 VALID_WINNERS = ("BUYER", "SELLER", "SPLIT")
 
+# Objective inspection / dispute window enforced by the contract. The seller may
+# only time-claim (claim_after_deadline) AFTER this window has elapsed, giving the
+# buyer a guaranteed period to review the delivery or open a dispute. The window
+# is measured against the consensus transaction datetime (gl.message_raw), which
+# every validator agrees on, so the deadline is objective on-chain state - not a
+# free-text hint a seller can bypass.
+DEFAULT_INSPECTION_SECONDS = 7 * 24 * 60 * 60   # 7 days
+MIN_INSPECTION_SECONDS = 60 * 60                # 1 hour floor
+MAX_INSPECTION_SECONDS = 365 * 24 * 60 * 60     # 1 year cap
+
 # Prompt-injection defense: every party-supplied or web-rendered string handed
 # to the LLM judge is wrapped in these fences and the model is told that fenced
 # content is untrusted DATA, never instructions. This stops a malicious party
@@ -245,6 +255,64 @@ def _now_iso() -> str:
         return ""
 
 
+def _iso_to_epoch(iso_str: str) -> int:
+    """Deterministically convert an ISO-8601 string to integer UNIX seconds.
+
+    Returns -1 when the value is empty or cannot be parsed. The conversion is
+    done with integer timedelta arithmetic ONLY (no ``datetime.timestamp()``),
+    because floating-point operations are banned in GenVM deterministic mode.
+    """
+    import datetime as _dt
+
+    s = (iso_str or "").strip()
+    if not s:
+        return -1
+    # fromisoformat accepts trailing 'Z' only on newer Pythons; normalize it.
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = _dt.datetime.fromisoformat(s)
+    except Exception:
+        return -1
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_dt.timezone.utc)
+    epoch = _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc)
+    delta = dt - epoch
+    # delta.days / delta.seconds are ints -> stays float-free for determinism.
+    return delta.days * 86400 + delta.seconds
+
+
+def _now_ts() -> int:
+    """Objective current time (UNIX seconds) for deadline enforcement.
+
+    Uses ``datetime.now(UTC)``, which in GenVM deterministic mode returns the
+    fixed transaction timestamp that every validator agrees on (not real wall
+    clock), so it is a deterministic on-chain clock. The conversion to epoch
+    seconds uses integer timedelta arithmetic only (no ``.timestamp()``) to
+    respect the deterministic-mode floating-point ban. Returns -1 if time is
+    somehow unavailable, which callers must treat as 'deadline not reached'."""
+    import datetime as _dt
+
+    try:
+        dt = _dt.datetime.now(_dt.timezone.utc)
+    except Exception:
+        return -1
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_dt.timezone.utc)
+    epoch = _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc)
+    delta = dt - epoch
+    return delta.days * 86400 + delta.seconds
+
+
+def _clamp_inspection_seconds(v: int) -> int:
+    v = int(v)
+    if v < MIN_INSPECTION_SECONDS:
+        return MIN_INSPECTION_SECONDS
+    if v > MAX_INSPECTION_SECONDS:
+        return MAX_INSPECTION_SECONDS
+    return v
+
+
 def _addr_hex(addr: Address) -> str:
     """Stable string key for TreeMap indexes."""
     return str(addr)
@@ -271,7 +339,8 @@ class Escrow:
     title: str
     description: str
     terms: str                 # release conditions / acceptance criteria
-    deadline_iso: str          # ISO string or human readable deadline description
+    deadline_iso: str          # human-readable deadline text (display only)
+    deadline_ts: u256          # OBJECTIVE deadline as UNIX seconds (enforced on-chain)
 
     status: str
     created_at: str
@@ -282,11 +351,18 @@ class Escrow:
     delivery_evidence: str     # links / proof of delivery
     delivery_submitted_at: str
 
-    # Dispute data
+    # Dispute data.
+    # Buyer and seller each own a SEPARATE, write-once record so evidence stays
+    # attributable and neither party can overwrite the other's (or their own)
+    # statement. ``dispute_raised_by`` records who first opened the dispute.
     dispute_raised_by: Address
-    dispute_reason: str
-    dispute_evidence: str      # newline or | separated links + notes
     dispute_raised_at: str
+    buyer_dispute_reason: str
+    buyer_dispute_evidence: str
+    buyer_dispute_at: str
+    seller_dispute_reason: str
+    seller_dispute_evidence: str
+    seller_dispute_at: str
 
     # Resolution data (populated by AI)
     resolved_winner: str       # BUYER | SELLER | SPLIT
@@ -321,6 +397,7 @@ def _serialize_escrow(esc: Escrow) -> str:
         "description": esc.description,
         "terms": esc.terms,
         "deadline_iso": esc.deadline_iso,
+        "deadline_ts": int(esc.deadline_ts),
         "status": esc.status,
         "created_at": esc.created_at,
         "funded_at": esc.funded_at,
@@ -328,9 +405,13 @@ def _serialize_escrow(esc: Escrow) -> str:
         "delivery_evidence": esc.delivery_evidence,
         "delivery_submitted_at": esc.delivery_submitted_at,
         "dispute_raised_by": str(esc.dispute_raised_by) if esc.dispute_raised_by else "",
-        "dispute_reason": esc.dispute_reason,
-        "dispute_evidence": esc.dispute_evidence,
         "dispute_raised_at": esc.dispute_raised_at,
+        "buyer_dispute_reason": esc.buyer_dispute_reason,
+        "buyer_dispute_evidence": esc.buyer_dispute_evidence,
+        "buyer_dispute_at": esc.buyer_dispute_at,
+        "seller_dispute_reason": esc.seller_dispute_reason,
+        "seller_dispute_evidence": esc.seller_dispute_evidence,
+        "seller_dispute_at": esc.seller_dispute_at,
         "resolved_winner": esc.resolved_winner,
         "resolved_release_bps": int(esc.resolved_release_bps),
         "resolution_reason": esc.resolution_reason,
@@ -354,16 +435,21 @@ def _deserialize_escrow(data: str) -> Escrow:
         description=d["description"],
         terms=d["terms"],
         deadline_iso=d["deadline_iso"],
+        deadline_ts=u256(d.get("deadline_ts", 0)),
         status=d["status"],
         created_at=d["created_at"],
         funded_at=d["funded_at"],
         delivery_note=d.get("delivery_note", ""),
         delivery_evidence=d.get("delivery_evidence", ""),
         delivery_submitted_at=d.get("delivery_submitted_at", ""),
-        dispute_raised_by=Address(d["dispute_raised_by"]) if d["dispute_raised_by"] else Address(ZERO_ADDRESS_HEX),
-        dispute_reason=d["dispute_reason"],
-        dispute_evidence=d["dispute_evidence"],
-        dispute_raised_at=d["dispute_raised_at"],
+        dispute_raised_by=Address(d["dispute_raised_by"]) if d.get("dispute_raised_by") else Address(ZERO_ADDRESS_HEX),
+        dispute_raised_at=d.get("dispute_raised_at", ""),
+        buyer_dispute_reason=d.get("buyer_dispute_reason", ""),
+        buyer_dispute_evidence=d.get("buyer_dispute_evidence", ""),
+        buyer_dispute_at=d.get("buyer_dispute_at", ""),
+        seller_dispute_reason=d.get("seller_dispute_reason", ""),
+        seller_dispute_evidence=d.get("seller_dispute_evidence", ""),
+        seller_dispute_at=d.get("seller_dispute_at", ""),
         resolved_winner=d["resolved_winner"],
         resolved_release_bps=u256(d["resolved_release_bps"]),
         resolution_reason=d["resolution_reason"],
@@ -469,6 +555,8 @@ class GenEscrow(gl.Contract):
             "description": esc.description,
             "terms": esc.terms,
             "deadline_iso": esc.deadline_iso,
+            "deadline_ts": int(esc.deadline_ts),
+            "deadline_passed": _now_ts() >= int(esc.deadline_ts) if int(esc.deadline_ts) > 0 else False,
             "status": esc.status,
             "created_at": esc.created_at,
             "funded_at": esc.funded_at,
@@ -476,9 +564,27 @@ class GenEscrow(gl.Contract):
             "delivery_evidence": esc.delivery_evidence,
             "delivery_submitted_at": esc.delivery_submitted_at,
             "dispute_raised_by": str(esc.dispute_raised_by) if esc.dispute_raised_by else "",
-            "dispute_reason": esc.dispute_reason,
-            "dispute_evidence": esc.dispute_evidence,
             "dispute_raised_at": esc.dispute_raised_at,
+            # Distinct, attributable dispute records (buyer vs seller).
+            "buyer_dispute_reason": esc.buyer_dispute_reason,
+            "buyer_dispute_evidence": esc.buyer_dispute_evidence,
+            "buyer_dispute_at": esc.buyer_dispute_at,
+            "seller_dispute_reason": esc.seller_dispute_reason,
+            "seller_dispute_evidence": esc.seller_dispute_evidence,
+            "seller_dispute_at": esc.seller_dispute_at,
+            # Legacy convenience fields: the initiating party's record, kept so
+            # existing frontends keep rendering. Attribution lives in the
+            # buyer_*/seller_* fields above.
+            "dispute_reason": (
+                esc.buyer_dispute_reason
+                if str(esc.dispute_raised_by) == str(esc.buyer)
+                else esc.seller_dispute_reason
+            ),
+            "dispute_evidence": (
+                esc.buyer_dispute_evidence
+                if str(esc.dispute_raised_by) == str(esc.buyer)
+                else esc.seller_dispute_evidence
+            ),
             "resolved_winner": esc.resolved_winner,
             "resolved_release_bps": int(esc.resolved_release_bps),
             "resolution_reason": esc.resolution_reason,
@@ -587,6 +693,20 @@ class GenEscrow(gl.Contract):
         net = u256(int(gross) - int(fee))
 
         now = _now_iso()
+        now_ts = _now_ts()
+
+        # Derive the OBJECTIVE deadline (UNIX seconds) enforced on-chain.
+        # 1. If the buyer supplied a parseable ISO date/time that is in the
+        #    future, honor it exactly.
+        # 2. Otherwise fall back to a fixed inspection window measured from the
+        #    funding time, so an escrow ALWAYS carries an objective deadline the
+        #    seller cannot short-circuit with vague free-text.
+        base_ts = now_ts if now_ts > 0 else 0
+        parsed_deadline = _iso_to_epoch(deadline_iso)
+        if parsed_deadline > 0 and parsed_deadline > base_ts:
+            deadline_ts = u256(parsed_deadline)
+        else:
+            deadline_ts = u256(base_ts + DEFAULT_INSPECTION_SECONDS)
 
         esc = Escrow(
             id=eid,
@@ -599,6 +719,7 @@ class GenEscrow(gl.Contract):
             description=description,
             terms=terms,
             deadline_iso=deadline_iso,
+            deadline_ts=deadline_ts,
             status=STATUS_FUNDED,
             created_at=now,
             funded_at=now,
@@ -606,9 +727,13 @@ class GenEscrow(gl.Contract):
             delivery_evidence="",
             delivery_submitted_at="",
             dispute_raised_by=Address(ZERO_ADDRESS_HEX),
-            dispute_reason="",
-            dispute_evidence="",
             dispute_raised_at="",
+            buyer_dispute_reason="",
+            buyer_dispute_evidence="",
+            buyer_dispute_at="",
+            seller_dispute_reason="",
+            seller_dispute_evidence="",
+            seller_dispute_at="",
             resolved_winner="",
             resolved_release_bps=u256(0),
             resolution_reason="",
@@ -727,14 +852,26 @@ class GenEscrow(gl.Contract):
     # ------------------------------------------------------------------
     @gl.public.write
     def raise_dispute(self, escrow_id: int, reason: str, evidence: str) -> None:
+        """Record the caller's side of a dispute.
+
+        Buyer and seller each own a SEPARATE, write-once record. The first party
+        to call this opens the dispute (moves it to DISPUTED); the counterparty
+        may then add THEIR own attributable statement. Neither party can
+        overwrite an existing record - not their own and not the other side's -
+        so evidence attribution and history are preserved. To correct a mistake
+        a party must resolve/close, not silently clobber the record.
+        """
         self._require_not_paused()
         esc = self._require_escrow(escrow_id)
 
-        if not self._is_buyer_or_seller(esc):
+        sender = gl.message.sender_address
+        is_buyer = sender == esc.buyer
+        is_seller = sender == esc.seller
+        if not (is_buyer or is_seller):
             raise gl.vm.UserError(f"{ERROR_EXPECTED} Only buyer or seller may raise dispute")
 
         # Either party may dispute before delivery (FUNDED), during buyer review
-        # (DELIVERY_SUBMITTED), or re-state an existing dispute (DISPUTED).
+        # (DELIVERY_SUBMITTED), or add their side to an existing dispute (DISPUTED).
         self._require_status(esc, [STATUS_FUNDED, STATUS_DELIVERY_SUBMITTED, STATUS_DISPUTED])
 
         reason = _safe_text(reason, 600).strip()
@@ -743,14 +880,32 @@ class GenEscrow(gl.Contract):
         if len(reason) < MIN_DISPUTE_REASON_LEN:
             raise gl.vm.UserError(f"{ERROR_EXPECTED} Dispute reason is too short")
 
-        sender = gl.message.sender_address
         now = _now_iso()
 
-        esc.status = STATUS_DISPUTED
-        esc.dispute_raised_by = sender
-        esc.dispute_reason = reason
-        esc.dispute_evidence = evidence
-        esc.dispute_raised_at = now
+        if is_buyer:
+            # Write-once: refuse to overwrite an existing buyer record.
+            if esc.buyer_dispute_at:
+                raise gl.vm.UserError(
+                    f"{ERROR_EXPECTED} Buyer dispute record already exists and cannot be overwritten"
+                )
+            esc.buyer_dispute_reason = reason
+            esc.buyer_dispute_evidence = evidence
+            esc.buyer_dispute_at = now
+        else:
+            if esc.seller_dispute_at:
+                raise gl.vm.UserError(
+                    f"{ERROR_EXPECTED} Seller dispute record already exists and cannot be overwritten"
+                )
+            esc.seller_dispute_reason = reason
+            esc.seller_dispute_evidence = evidence
+            esc.seller_dispute_at = now
+
+        # First caller opens the dispute; subsequent counterparty statement keeps
+        # the original initiator attribution.
+        if esc.status != STATUS_DISPUTED:
+            esc.status = STATUS_DISPUTED
+            esc.dispute_raised_by = sender
+            esc.dispute_raised_at = now
 
         self.escrows[u256(escrow_id)] = _serialize_escrow(esc)
 
@@ -775,10 +930,16 @@ class GenEscrow(gl.Contract):
         delivery_note = esc.delivery_note
         delivery_evidence = esc.delivery_evidence
         dispute_raised_by = str(esc.dispute_raised_by)
-        dispute_reason = esc.dispute_reason
-        dispute_evidence = esc.dispute_evidence
+        buyer_dispute_reason = esc.buyer_dispute_reason
+        buyer_dispute_evidence = esc.buyer_dispute_evidence
+        seller_dispute_reason = esc.seller_dispute_reason
+        seller_dispute_evidence = esc.seller_dispute_evidence
 
-        def build_prompt(seller_evidence_block: str, dispute_evidence_block: str) -> str:
+        def build_prompt(
+            seller_delivery_block: str,
+            buyer_dispute_block: str,
+            seller_dispute_block: str,
+        ) -> str:
             # Authoritative instructions live OUTSIDE the fences. Every field
             # below is untrusted (set by adversarial parties or fetched from a
             # linked webpage), so each is wrapped with _fence() and the model is
@@ -802,10 +963,16 @@ class GenEscrow(gl.Contract):
                 f"DESCRIPTION:\n{_fence(description)}\n\n"
                 f"RELEASE TERMS / CONDITIONS:\n{_fence(terms)}\n\n"
                 f"SELLER DELIVERY NOTE:\n{_fence(delivery_note)}\n\n"
-                f"{seller_evidence_block}\n\n"
-                f"DISPUTE RAISED BY: {dispute_raised_by}\n"
-                f"DISPUTE REASON:\n{_fence(dispute_reason)}\n\n"
-                f"{dispute_evidence_block}\n\n"
+                f"{seller_delivery_block}\n\n"
+                f"DISPUTE FIRST OPENED BY: {dispute_raised_by}\n\n"
+                "--- BUYER'S DISPUTE STATEMENT (attributable to the buyer) ---\n"
+                f"BUYER DISPUTE REASON:\n{_fence(buyer_dispute_reason)}\n"
+                f"{buyer_dispute_block}\n\n"
+                "--- SELLER'S DISPUTE STATEMENT (attributable to the seller) ---\n"
+                f"SELLER DISPUTE REASON:\n{_fence(seller_dispute_reason)}\n"
+                f"{seller_dispute_block}\n\n"
+                "Weigh each party's OWN statement and evidence separately; do not\n"
+                "assume a party endorses the other's claims.\n\n"
                 "Return ONLY a compact JSON object with exactly these fields:\n"
                 "{\n"
                 '  "winner": "SELLER" | "BUYER" | "SPLIT",\n'
@@ -822,13 +989,19 @@ class GenEscrow(gl.Contract):
         def leader_fn():
             # Fetch + render every evidence link live INSIDE the non-deterministic
             # block, then judge the rendered content rather than the raw URLs.
-            seller_evidence_block = _render_evidence_block(
+            # Each party's evidence is rendered into its own attributable block.
+            seller_delivery_block = _render_evidence_block(
                 "SELLER DELIVERY EVIDENCE", delivery_evidence
             )
-            dispute_evidence_block = _render_evidence_block(
-                "DISPUTE EVIDENCE / LINKS", dispute_evidence
+            buyer_dispute_block = _render_evidence_block(
+                "BUYER DISPUTE EVIDENCE / LINKS", buyer_dispute_evidence
             )
-            prompt = build_prompt(seller_evidence_block, dispute_evidence_block)
+            seller_dispute_block = _render_evidence_block(
+                "SELLER DISPUTE EVIDENCE / LINKS", seller_dispute_evidence
+            )
+            prompt = build_prompt(
+                seller_delivery_block, buyer_dispute_block, seller_dispute_block
+            )
             raw = gl.nondet.exec_prompt(prompt, response_format="json")
             data = _coerce_dict(raw)
 
@@ -884,7 +1057,7 @@ class GenEscrow(gl.Contract):
 
         self._require_status(esc, [STATUS_DISPUTED])
 
-        if not esc.dispute_reason:
+        if not esc.buyer_dispute_reason and not esc.seller_dispute_reason:
             raise gl.vm.UserError(f"{ERROR_EXPECTED} No dispute to resolve")
 
         judgment = self._judge_dispute(esc)
@@ -946,10 +1119,20 @@ class GenEscrow(gl.Contract):
         # as long as no dispute is open.
         self._require_status(esc, [STATUS_FUNDED, STATUS_DELIVERY_SUBMITTED])
 
-        # NOTE: Deadline enforcement here is best-effort / advisory.
-        # Real on-chain time is not available. Frontends + validators
-        # should only call this after verifying the deadline off-chain.
-        # We do not perform a hard block on-chain to avoid non-determinism.
+        # STRICT, OBJECTIVE DEADLINE ENFORCEMENT.
+        # The seller may only time-claim AFTER the escrow's deadline has passed.
+        # The current time comes from the consensus transaction datetime
+        # (gl.message_raw), which every validator agrees on, so this check is
+        # deterministic and cannot be bypassed. Before the deadline the buyer
+        # keeps a guaranteed window to review the delivery, release early, or
+        # open a dispute. If the time source is somehow unavailable (now_ts < 0)
+        # we fail closed and reject the claim.
+        now_ts = _now_ts()
+        deadline_ts = int(esc.deadline_ts)
+        if now_ts < 0 or now_ts < deadline_ts:
+            raise gl.vm.UserError(
+                f"{ERROR_EXPECTED} Deadline has not passed; seller cannot claim yet"
+            )
 
         # A time-based claim is a successful payout to the seller, so it is
         # treated like release(): seller gets the net amount and the reserved

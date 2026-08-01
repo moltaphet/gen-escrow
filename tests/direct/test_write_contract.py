@@ -215,9 +215,12 @@ def test_dispute_after_delivery_submitted(escrow, direct_vm, direct_alice, direc
 
 
 def test_claim_after_deadline_from_delivery_submitted(escrow, direct_vm, direct_alice, direct_bob):
-    """Seller can time-claim after having submitted delivery."""
+    """Seller can time-claim after having submitted delivery AND the deadline passed."""
+    direct_vm.warp("2026-07-01T00:00:00+00:00")
     eid = _submit_delivery(direct_vm, escrow, direct_bob, _fund(direct_vm, escrow, direct_alice, direct_bob))
 
+    # Advance past the objective deadline (deadline_iso "2026-08-01").
+    direct_vm.warp("2026-09-01T00:00:00+00:00")
     direct_vm.sender = direct_bob
     escrow.claim_after_deadline(eid)
     assert escrow.get_escrow(eid)["status"] == "EXPIRED"
@@ -530,8 +533,11 @@ def test_resolve_dispute_requires_disputed_state(escrow, direct_vm, direct_alice
 # claim_after_deadline
 # ===========================================================================
 def test_claim_after_deadline_by_seller(escrow, direct_vm, direct_alice, direct_bob):
+    direct_vm.warp("2026-07-01T00:00:00+00:00")
     eid = _fund(direct_vm, escrow, direct_alice, direct_bob, value=ONE_GEN)
 
+    # Only claimable once the objective deadline (2026-08-01) has passed.
+    direct_vm.warp("2026-09-01T00:00:00+00:00")
     direct_vm.sender = direct_bob
     escrow.claim_after_deadline(eid)
 
@@ -629,3 +635,186 @@ def test_withdraw_fees_rejects_zero_address(escrow, direct_vm, direct_owner, dir
     direct_vm.sender = direct_owner
     with direct_vm.expect_revert("[EXPECTED] Cannot withdraw to the zero address"):
         escrow.withdraw_fees("0x0000000000000000000000000000000000000000")
+
+
+# ===========================================================================
+# ADVERSARIAL: strict deadline enforcement on claim_after_deadline
+#
+# Regression coverage for the reviewer finding "a seller can claim immediately
+# without any deadline check, bypassing buyer review and dispute resolution".
+# The deadline is now objective on-chain state (deadline_ts), compared against
+# the consensus transaction datetime, so the seller cannot short-circuit it.
+# ===========================================================================
+def test_claim_after_deadline_rejects_premature_claim(escrow, direct_vm, direct_alice, direct_bob):
+    """A seller who tries to claim BEFORE the objective deadline must fail
+    cleanly, and the funds must stay locked (no payout, state unchanged)."""
+    direct_vm.warp("2026-07-01T00:00:00+00:00")
+    eid = _fund(direct_vm, escrow, direct_alice, direct_bob, value=ONE_GEN)  # deadline 2026-08-01
+
+    # Still comfortably before the deadline.
+    direct_vm.warp("2026-07-15T00:00:00+00:00")
+    direct_vm.sender = direct_bob
+    with direct_vm.expect_revert("[EXPECTED] Deadline has not passed; seller cannot claim yet"):
+        escrow.claim_after_deadline(eid)
+
+    # Nothing moved: escrow is still FUNDED and the seller has no claimable.
+    esc = escrow.get_escrow(eid)
+    assert esc["status"] == "FUNDED"
+    assert escrow.get_claimable(_addr(direct_bob)) == 0
+
+
+def test_claim_after_deadline_premature_even_after_delivery(escrow, direct_vm, direct_alice, direct_bob):
+    """Even after submitting delivery, the seller cannot jump the queue and
+    time-claim before the buyer's review window (deadline) elapses."""
+    direct_vm.warp("2026-07-01T00:00:00+00:00")
+    eid = _submit_delivery(direct_vm, escrow, direct_bob, _fund(direct_vm, escrow, direct_alice, direct_bob))
+
+    direct_vm.warp("2026-07-20T00:00:00+00:00")  # before 2026-08-01
+    direct_vm.sender = direct_bob
+    with direct_vm.expect_revert("[EXPECTED] Deadline has not passed; seller cannot claim yet"):
+        escrow.claim_after_deadline(eid)
+    assert escrow.get_escrow(eid)["status"] == "DELIVERY_SUBMITTED"
+
+
+def test_claim_after_deadline_boundary(escrow, direct_vm, direct_alice, direct_bob):
+    """One second before the deadline is rejected; at/after the deadline the
+    claim is allowed. Proves the boundary is enforced objectively."""
+    direct_vm.warp("2026-07-01T00:00:00+00:00")
+    eid = _fund(direct_vm, escrow, direct_alice, direct_bob, value=ONE_GEN)  # deadline 2026-08-01T00:00:00
+
+    # Just before the deadline -> rejected.
+    direct_vm.warp("2026-07-31T23:59:59+00:00")
+    direct_vm.sender = direct_bob
+    with direct_vm.expect_revert("[EXPECTED] Deadline has not passed; seller cannot claim yet"):
+        escrow.claim_after_deadline(eid)
+
+    # Exactly at the deadline -> allowed.
+    direct_vm.warp("2026-08-01T00:00:00+00:00")
+    direct_vm.sender = direct_bob
+    escrow.claim_after_deadline(eid)
+    assert escrow.get_escrow(eid)["status"] == "EXPIRED"
+    assert escrow.get_claimable(_addr(direct_bob)) == _net_of(ONE_GEN)
+
+
+def test_buyer_can_release_early_despite_deadline(escrow, direct_vm, direct_alice, direct_bob):
+    """The deadline only gates the SELLER's unilateral time-claim. The buyer may
+    still approve/release early - buyer approval is the sanctioned bypass."""
+    direct_vm.warp("2026-07-01T00:00:00+00:00")
+    eid = _fund(direct_vm, escrow, direct_alice, direct_bob, value=ONE_GEN)
+
+    direct_vm.sender = direct_alice
+    escrow.release(eid)  # well before the 2026-08-01 deadline
+    assert escrow.get_escrow(eid)["status"] == "COMPLETED"
+    assert escrow.get_claimable(_addr(direct_bob)) == _net_of(ONE_GEN)
+
+
+# ===========================================================================
+# ADVERSARIAL: separately-attributable, non-overwritable dispute records
+#
+# Regression coverage for "either party can overwrite the active dispute
+# record". Buyer and seller now own distinct, write-once records.
+# ===========================================================================
+def test_dispute_records_are_separately_attributable(escrow, direct_vm, direct_alice, direct_bob):
+    """Buyer and seller each file their OWN statement; both are stored in
+    distinct fields and stay attributable to the party that submitted them."""
+    eid = _fund(direct_vm, escrow, direct_alice, direct_bob)
+
+    direct_vm.sender = direct_alice  # buyer opens
+    escrow.raise_dispute(eid, "Seller delivered the wrong files entirely", "https://buyer.example/proof")
+    direct_vm.sender = direct_bob  # seller rebuts
+    escrow.raise_dispute(eid, "Buyer refused to accept the correct delivery", "https://seller.example/proof")
+
+    esc = escrow.get_escrow(eid)
+    assert esc["status"] == "DISPUTED"
+    # The first opener is recorded and preserved as the buyer.
+    assert esc["dispute_raised_by"].lower() == _addr(direct_alice).lower()
+    # Each party's own record is intact and distinct.
+    assert "wrong files" in esc["buyer_dispute_reason"]
+    assert esc["buyer_dispute_evidence"] == "https://buyer.example/proof"
+    assert "refused to accept" in esc["seller_dispute_reason"]
+    assert esc["seller_dispute_evidence"] == "https://seller.example/proof"
+    assert esc["buyer_dispute_at"] and esc["seller_dispute_at"]
+
+
+def test_raise_dispute_rejects_buyer_overwrite(escrow, direct_vm, direct_alice, direct_bob):
+    """A party cannot overwrite its own dispute record; the original evidence
+    survives the tamper attempt."""
+    eid = _fund(direct_vm, escrow, direct_alice, direct_bob)
+
+    direct_vm.sender = direct_alice
+    escrow.raise_dispute(eid, "Original buyer complaint about missing work", "https://buyer.example/original")
+
+    direct_vm.sender = direct_alice
+    with direct_vm.expect_revert(
+        "[EXPECTED] Buyer dispute record already exists and cannot be overwritten"
+    ):
+        escrow.raise_dispute(eid, "Rewritten complaint that changes the record", "https://buyer.example/tampered")
+
+    esc = escrow.get_escrow(eid)
+    assert "Original buyer complaint" in esc["buyer_dispute_reason"]
+    assert esc["buyer_dispute_evidence"] == "https://buyer.example/original"
+
+
+def test_raise_dispute_rejects_seller_overwrite(escrow, direct_vm, direct_alice, direct_bob):
+    """Same write-once guarantee for the seller's record."""
+    eid = _fund(direct_vm, escrow, direct_alice, direct_bob)
+
+    direct_vm.sender = direct_bob
+    escrow.raise_dispute(eid, "Seller says the deliverable was completed on time", "https://seller.example/original")
+
+    direct_vm.sender = direct_bob
+    with direct_vm.expect_revert(
+        "[EXPECTED] Seller dispute record already exists and cannot be overwritten"
+    ):
+        escrow.raise_dispute(eid, "Seller trying to overwrite with new claims", "https://seller.example/tampered")
+
+    esc = escrow.get_escrow(eid)
+    assert "completed on time" in esc["seller_dispute_reason"]
+    assert esc["seller_dispute_evidence"] == "https://seller.example/original"
+
+
+def test_dispute_race_cannot_clobber_counterparty(escrow, direct_vm, direct_alice, direct_bob):
+    """Adversarial race: after both sides file, neither can overwrite the other's
+    record (or their own). Attribution and history survive the race."""
+    eid = _fund(direct_vm, escrow, direct_alice, direct_bob)
+
+    direct_vm.sender = direct_alice
+    escrow.raise_dispute(eid, "Buyer: seller never delivered anything at all", "https://buyer.example/a")
+    direct_vm.sender = direct_bob
+    escrow.raise_dispute(eid, "Seller: the delivery was made and accepted", "https://seller.example/b")
+
+    # Buyer tries to re-file to bury the seller's rebuttal -> rejected.
+    direct_vm.sender = direct_alice
+    with direct_vm.expect_revert(
+        "[EXPECTED] Buyer dispute record already exists and cannot be overwritten"
+    ):
+        escrow.raise_dispute(eid, "Buyer trying again to dominate the record", "")
+
+    # Both original, attributable records remain untouched.
+    esc = escrow.get_escrow(eid)
+    assert "never delivered" in esc["buyer_dispute_reason"]
+    assert esc["buyer_dispute_evidence"] == "https://buyer.example/a"
+    assert "delivery was made" in esc["seller_dispute_reason"]
+    assert esc["seller_dispute_evidence"] == "https://seller.example/b"
+
+
+def test_resolve_dispute_uses_both_party_statements(escrow, direct_vm, direct_alice, direct_bob):
+    """The judge must see BOTH parties' attributable statements. The LLM mock
+    only fires when unique tokens from the buyer's AND the seller's records are
+    both present in the prompt."""
+    eid = _fund(direct_vm, escrow, direct_alice, direct_bob, value=ONE_GEN)
+
+    direct_vm.sender = direct_alice
+    escrow.raise_dispute(eid, "Buyer says BUYERTOKEN_A1 nothing usable arrived", "")
+    direct_vm.sender = direct_bob
+    escrow.raise_dispute(eid, "Seller says SELLERTOKEN_B2 everything was delivered", "")
+
+    # Requires both tokens -> proves both records reached the judge distinctly.
+    direct_vm.mock_llm(
+        r"(?s)BUYERTOKEN_A1.*SELLERTOKEN_B2",
+        json.dumps({"winner": "SPLIT", "release_bps": 5000, "reason": "Both sides partially right."}),
+    )
+
+    direct_vm.sender = direct_alice
+    result = escrow.resolve_dispute(eid)
+    assert result["winner"] == "SPLIT"
