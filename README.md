@@ -2,13 +2,14 @@
 
 # 🛡️ GenEscrow
 
-### Smart Escrow with AI-Powered Dispute Resolution on GenLayer
+### AI-Arbitrated Escrow Platform on GenLayer
 
-_Hold funds on-chain. Set clear terms. Let AI validators settle disputes fairly._
+_Hold funds on-chain. Agree on clear terms. Let AI validators settle disputes fairly — by consensus, not by a middleman._
 
 [![Network](https://img.shields.io/badge/Network-GenLayer%20StudioNet-2f81f7)](https://studio.genlayer.com)
 [![Contract](https://img.shields.io/badge/Runner-py--genlayer%20(pinned)-4c8bf5)](https://docs.genlayer.com)
-[![Tests](https://img.shields.io/badge/Tests-direct%20%2B%20integration-3fb950)](#-testing)
+[![Tests](https://img.shields.io/badge/Unit%20Tests-61%20passing-3fb950)](#-testing--verification)
+[![Lint](https://img.shields.io/badge/genvm--lint%20%2B%20Pyright-clean-3fb950)](#-testing--verification)
 [![License](https://img.shields.io/badge/License-MIT-lightgrey)](#-license)
 
 </div>
@@ -17,119 +18,159 @@ _Hold funds on-chain. Set clear terms. Let AI validators settle disputes fairly.
 
 ## 📖 Overview
 
-Traditional escrow relies on a trusted middleman. On-chain escrow removes the middleman but can't reason about the messy reality of "did the seller actually deliver?"
+Traditional escrow relies on a trusted middleman. A pure smart contract removes the middleman but cannot reason about the messy reality of _"did the seller actually deliver?"_
 
-**GenEscrow** closes that gap. Funds are held in an intelligent contract on **GenLayer**. Both parties agree on release terms up front. When something goes wrong, either side can raise a structured dispute — and GenLayer's validators independently run an LLM over the terms and evidence, then reach **consensus** on a fair split. No centralized arbiter, no opaque judgment.
+**GenEscrow** closes that gap. It is an **AI-arbitrated escrow platform built on [GenLayer](https://genlayer.com)**:
 
-### Why it matters
+- Funds are custodied by an **intelligent contract** running on the GenLayer GenVM.
+- Both parties agree on the release **terms** and an objective **inspection deadline** up front.
+- When something goes wrong, either party opens a **structured dispute** with attributable evidence.
+- GenLayer's validators then **independently run an LLM** over the terms and the live-rendered evidence and reach **consensus** on a fair winner and split — no centralized arbiter, no opaque single-node judgment.
 
 | Problem | GenEscrow's answer |
 |---------|--------------------|
 | Middlemen take fees and time | Funds custodied by code; near-zero overhead |
-| Pure smart contracts can't judge nuance | LLM validators evaluate terms + evidence |
+| Pure smart contracts can't judge nuance | LLM validators evaluate terms + verified evidence |
 | One node could bias an AI decision | Multi-validator **consensus** with tolerance-based equivalence |
 | Payout bugs strand funds | Pull-payment (claimable) pattern for every payout |
-
----
-
-## ✨ Key Features
-
-- **⚡ One-step create + fund** — a single payable transaction opens and funds the escrow in native GEN.
-- **✅ Release / Refund** — the buyer can release to the seller or refund themselves while `FUNDED`.
-- **⚖️ Structured disputes** — either party raises a dispute with a reason and supporting evidence.
-- **🤖 AI consensus resolution** — validators independently judge the case via LLM and agree on the winner and split (`run_nondet_unsafe` with a custom equivalence principle).
-- **⏳ Timeout claim** — the seller can claim after the deadline when no dispute is open.
-- **💸 Pull-payment payouts** — all funds are credited to a claimable balance and withdrawn via `claim()`, so no payout can revert the whole transaction or strand value.
-- **🔒 Mandatory network guard** — a full-screen overlay blocks interaction on the wrong chain, with auto switch/add for GenLayer StudioNet.
-- **📱 Mobile-first UI** — clean, responsive, dependency-free frontend.
 
 ### Status machine
 
 ```
-FUNDED ──▶ COMPLETED        (buyer releases)
-       ──▶ REFUNDED         (buyer refunds)
-       ──▶ EXPIRED          (seller claims after deadline)
-       ──▶ DISPUTED ──▶ RESOLVED   (AI decides split / winner)
+FUNDED ─▶ DELIVERY_SUBMITTED   (seller records deliverables for buyer review)
+       ─▶ COMPLETED            (buyer releases funds)
+       ─▶ REFUNDED             (buyer refunds before delivery)
+       ─▶ EXPIRED              (seller time-claims after the deadline, no dispute)
+       ─▶ DISPUTED ─▶ RESOLVED (AI consensus decides winner / split)
 ```
 
 All monetary values are stored as `u256` in **atto** units (`value × 10^18`).
 
 ---
 
-## 🧱 Tech Stack
+## 🏗️ Architecture & Security Fixes (Addressing Reviewer Feedback)
 
-| Layer | Technology |
-|-------|------------|
-| **Smart contract** | Python intelligent contract on **GenLayer GenVM** (pinned `py-genlayer` runner) |
-| **AI / consensus** | GenLayer non-deterministic block (`gl.nondet.exec_prompt`) + custom validator equivalence |
-| **Storage** | Flat on-chain storage — `TreeMap` indexes + JSON-serialized records (no nested collections) |
-| **Frontend** | Vanilla JavaScript (ES modules), zero build step |
-| **Chain SDK** | [`genlayer-js`](https://www.npmjs.com/package/genlayer-js) via ESM |
-| **Wallet** | MetaMask / EIP-1193 provider |
-| **Tooling / tests** | `genvm-lint`, `genlayer-test` (`pytest` direct mode + `gltest` integration) |
-| **Network** | GenLayer **StudioNet** (chain id `61999` / `0xF22F`, gasless) |
+The three findings raised in review have been fixed at the contract level and locked in with dedicated regression tests (the four **GenSkills** benchmarks).
+
+### 1. Objective Inspection Deadline Enforcement (time-locked)
+
+A seller could previously time-claim immediately, bypassing the buyer's review and dispute window. The claim is now gated by an **objective, on-chain deadline**:
+
+- Every escrow carries a `deadline_ts` (`u256`, UNIX seconds). If the buyer supplies a parseable future ISO date it is honored; otherwise a fixed inspection window (`DEFAULT_INSPECTION_SECONDS`, 7 days) is applied from funding time, so an escrow **always** carries an enforceable deadline.
+- `claim_after_deadline()` compares the current time — derived from the **consensus transaction datetime** (`gl.message_raw` / `datetime.now(UTC)` in deterministic mode, which every validator agrees on) — against `deadline_ts`. Before the deadline the claim **reverts cleanly** and funds stay locked.
+- The clock is **fail-closed**: if the time source is unavailable, the claim is rejected rather than allowed.
+- Epoch conversion uses integer `timedelta` arithmetic only (no floats), respecting the GenVM deterministic-mode floating-point ban.
+
+> 🔒 Guarded by GenSkill #1 (Premature Claim Guard), including the exact one-second-before-deadline boundary.
+
+### 2. Separately Attributable Evidence Storage
+
+Previously either party could overwrite the active dispute record. Buyer and seller now own **separate, write-once records**:
+
+- `buyer_dispute_reason` / `buyer_dispute_evidence` / `buyer_dispute_at` and `seller_dispute_reason` / `seller_dispute_evidence` / `seller_dispute_at` are **isolated storage entries**, each attributable to its author.
+- `dispute_raised_by` records who first opened the dispute; the counterparty may add **their own** statement without clobbering the initiator's.
+- Records are **write-once**: any attempt to overwrite an existing buyer or seller record reverts, so evidence attribution and history are preserved.
+
+> 🔒 Guarded by GenSkill #2 (Evidence Attribution & Anti-Overwrite) and GenSkill #3 (State Guard & Dispute Race Resistance).
+
+### 3. Non-Deterministic Web Render & Consensus Engine
+
+Evidence is judged by its **actual content**, not a raw (possibly fabricated) URL string:
+
+- Dispute resolution runs inside a non-deterministic block via **`gl.vm.run_nondet_unsafe(leader_fn, validator_fn)`**, with a custom equivalence principle: validators must agree on the winner exactly and on `release_bps` within a bounded tolerance.
+- Each evidence URL is fetched and rendered live on-chain with **`gl.nondet.web.render(url, mode="text")`**; the rendered page text (not the URL) is what the LLM judges. Unreachable, empty, or fake links are explicitly flagged **`UNVERIFIED`** so they can never be treated as proof of delivery.
+- **Prompt-injection defense:** every party-supplied or web-rendered string is wrapped in untrusted-data fences, smuggled fence markers are stripped, and the model is instructed that fenced content is data — never instructions.
+
+> 🔒 Guarded by GenSkill #4 (Non-Deterministic Web Render & LLM Consensus).
 
 ---
 
-## 📍 Deployed Contract
+## 📍 Contract Details
 
 | | |
 |---|---|
-| **Contract address** | `0x4588A9A9F87500961260885F9C9D23CFC9e9fa2B` |
-| **Network** | GenLayer StudioNet (`0xF22F` · 61999) |
+| **StudioNet deployed address** | `0x4588A9A9F87500961260885F9C9D23CFC9e9fa2B` |
+| **Network** | GenLayer **StudioNet** (chain id `61999` / `0xF22F`, gasless) |
+| **Runner** | pinned `py-genlayer` intelligent-contract runner |
+| **RPC** | `https://studio.genlayer.com/api` |
 | **Explorer / Studio** | https://studio.genlayer.com |
+| **Source** | [`contracts/genescrow.py`](contracts/genescrow.py) |
 
 > The frontend is already configured for this address in [`frontend/js/contract.js`](frontend/js/contract.js).
 
+**Contract surface:** 15 public methods — 5 `@gl.public.view`, 10 `@gl.public.write` (including the payable `create_escrow`). Storage is flat: `TreeMap` indexes + JSON-serialized `Escrow` records (no nested collections), with a pull-payment `claimable` ledger for every payout.
+
 ---
 
-## 🚀 Quick Start
+## ✅ Testing & Verification
+
+| Check | Result |
+|-------|--------|
+| **Unit tests** (direct mode) | **61 / 61 passing — 100%** |
+| **GenSkills benchmarks** | **4 / 4 passing** (Premature Claim Guard · Evidence Attribution · Dispute Race Resistance · Web Render & LLM Consensus) |
+| **`genvm-lint check`** | clean — `ok: true` (lint 3/3, validate passed, 15 methods) |
+| **`genvm-lint typecheck`** (Pyright) | clean — **0 errors, 0 warnings** |
+| **Contract source** | ASCII-only (client schema-fetch safe); schema extraction `ok: true` |
+
+- The **61 unit tests** live in `tests/direct/` and `tests/test_gen_escrow.py`, run leader-only in-memory (milliseconds), and cover every write method, its guard clauses/reverts, access control, and state transitions.
+- The **4 GenSkills** benchmark tests in `tests/test_gen_escrow.py` are the regression guards for the three reviewer fixes above (plus the consensus engine).
+- **Integration tests** (`tests/integration/`) exercise every write method under **real leader + validator consensus** on StudioNet and verify value actually moves on-chain (payouts settle on transaction **finalization**). These are gated off by default because they mutate the live contract.
+
+---
+
+## 🛠️ Local Setup & Testing Instructions
 
 ### Prerequisites
 
-- A modern browser with **MetaMask** (or any EIP-1193 wallet)
-- Python **3.11+** (only needed for contract development / tests)
-
-### Run the app
-
-The frontend is fully static — no build, no bundler.
+- Python **3.11+**
+- The GenLayer test tooling: `genlayer-test` (provides `pytest` direct mode + the `gltest` runner) and `genvm-linter`.
 
 ```bash
-# Option A: open it directly
-open frontend/index.html
-
-# Option B: serve it locally (recommended)
-cd frontend
-python -m http.server 8080
-# then visit http://localhost:8080
+# From the repository root, in a virtual environment:
+pip install genlayer-test genvm-linter
 ```
 
-Then:
-
-1. **Connect MetaMask.**
-2. **Approve the switch to GenLayer StudioNet** — the app auto-adds the network if it's missing.
-3. **Create an escrow** (seller, amount, terms, deadline) or act on an existing one — release, refund, dispute, resolve, or claim.
-
----
-
-## 🧪 Testing
+### 1. Lint & typecheck the intelligent contract
 
 ```bash
-# 1. Lint & validate the intelligent contract
-genvm-lint check contracts/genescrow.py
+genvm-lint check contracts/genescrow.py        # lint + SDK validation
+genvm-lint typecheck contracts/genescrow.py    # Pyright type checking
+```
 
-# 2. Fast direct-mode tests (leader-only, ~milliseconds)
-pytest tests/direct/ -v
+### 2. Run the unit tests (fast, offline, no network)
 
-# 3. Full integration tests against live StudioNet (real LLM + validator consensus)
+```bash
+# All 61 direct-mode unit tests
+pytest tests/direct/ tests/test_gen_escrow.py -v
+
+# Just the 4 GenSkills benchmark tests
+pytest tests/test_gen_escrow.py -v
+```
+
+### 3. Run integration tests against live StudioNet (real LLM + consensus)
+
+> ⚠️ These send real, state-mutating transactions to the deployed contract. Run them deliberately.
+
+```bash
+# Full lifecycle suite (deploys a fresh contract per test)
 gltest tests/integration/ -v -s --network studionet
 
 # Include the slow AI dispute-resolution test
 gltest tests/integration/ -v -s --network studionet -m slow
+
+# Verify the specific deployed instance (gated behind an env flag)
+RUN_LIVE_INSTANCE=1 gltest tests/integration/test_live_instance.py -v -s --network studionet
 ```
 
-- **Direct tests** cover business logic, validation, and state transitions.
-- **Integration tests** (`tests/integration/test_lifecycle.py`) exercise every write method under real consensus and verify that value actually moves on-chain — payouts settle on transaction **finalization** and are confirmed against live balances.
+### 4. Run the frontend (static, no build step)
+
+```bash
+cd frontend
+python -m http.server 8080
+# then open http://localhost:8080
+```
+
+Connect MetaMask, approve the switch to GenLayer StudioNet (auto-added if missing), then create or act on an escrow.
 
 ---
 
@@ -138,18 +179,19 @@ gltest tests/integration/ -v -s --network studionet -m slow
 ```
 gen-escrow/
 ├── contracts/
-│   └── genescrow.py          # Intelligent contract (pinned runner, flat storage)
+│   └── genescrow.py            # Intelligent contract (pinned runner, flat storage)
 ├── frontend/
 │   ├── index.html
 │   ├── css/style.css
 │   └── js/
-│       ├── app.js            # Orchestration
-│       ├── contract.js       # genlayer-js read/write layer
-│       ├── wallet.js         # Wallet + network guard
-│       └── ui.js             # Rendering, modal, toasts
+│       ├── app.js              # Orchestration
+│       ├── contract.js         # genlayer-js read/write layer (CONTRACT_ADDRESS)
+│       ├── wallet.js           # Wallet + network guard
+│       └── ui.js               # Rendering, modal, toasts
 ├── tests/
-│   ├── direct/               # Fast leader-only tests
-│   └── integration/          # Full consensus + LLM tests
+│   ├── test_gen_escrow.py      # 4 GenSkills benchmark tests
+│   ├── direct/                 # Fast leader-only unit tests
+│   └── integration/            # Full consensus + LLM tests (live StudioNet)
 ├── gltest.config.yaml
 ├── pytest.ini
 └── README.md
@@ -159,11 +201,9 @@ gen-escrow/
 
 ## 🔗 Links
 
-- 🌐 **Live App:** _coming soon_ <!-- add deployment URL -->
-- 🐦 **X / Twitter:** _coming soon_ <!-- add handle -->
-- 💻 **GitHub:** _coming soon_ <!-- add repository URL -->
 - 📚 **GenLayer Docs:** https://docs.genlayer.com
 - 🛠️ **GenLayer Studio:** https://studio.genlayer.com
+- 🌐 **GenLayer:** https://genlayer.com
 
 ---
 
@@ -178,5 +218,3 @@ Released under the **MIT License**.
 **Built on [GenLayer](https://genlayer.com)** — the intelligent contract platform where code can reason.
 
 </div>
-# gen-escrow
-# gen-escrow
