@@ -3,7 +3,7 @@
 
    Run with Node's built-in runner (no dependencies, no install):
 
-       node --test frontend/test/
+       cd frontend && npm test
 
    These cover the reviewer's "both UI roles" requirement: the buyer and the
    seller each see BOTH evidence records, but each may only submit their OWN
@@ -15,7 +15,7 @@ import assert from "node:assert/strict";
 
 import {
   partyRole, formatCountdown, disputeBadge, disputeRecords, disputeCapabilities,
-  ROLE_BUYER, ROLE_SELLER, ROLE_OBSERVER,
+  canOpenDispute, ROLE_BUYER, ROLE_SELLER, ROLE_OBSERVER,
 } from "../js/dispute-view.js";
 
 const BUYER = "0x1111111111111111111111111111111111111111";
@@ -292,5 +292,26 @@ test("no dispute actions outside the DISPUTED state", () => {
     assert.equal(caps.canFileStatement, false);
     assert.equal(caps.canWaiveResponse, false);
     assert.equal(caps.canResolve, false);
+  }
+});
+
+/* -------------------------------------------------- opening a dispute */
+
+test("only the two counterparties may open a dispute", () => {
+  for (const status of ["FUNDED", "DELIVERY_SUBMITTED"]) {
+    const esc = escrow({ status });
+    assert.equal(canOpenDispute(esc, BUYER), true);
+    assert.equal(canOpenDispute(esc, SELLER), true);
+    // An observer must not be offered an action the contract rejects.
+    assert.equal(canOpenDispute(esc, OUTSIDER), false);
+    assert.equal(canOpenDispute(esc, null), false);
+  }
+});
+
+test("a dispute cannot be opened from a non-disputable state", () => {
+  for (const status of ["DISPUTED", "RESOLVED", "COMPLETED", "REFUNDED", "EXPIRED"]) {
+    const esc = escrow({ status });
+    assert.equal(canOpenDispute(esc, BUYER), false);
+    assert.equal(canOpenDispute(esc, SELLER), false);
   }
 });

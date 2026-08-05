@@ -120,7 +120,7 @@ Evidence is judged by its **actual content**, not a raw (possibly fabricated) UR
 
 | | |
 |---|---|
-| **StudioNet deployed address** | `0x4588A9A9F87500961260885F9C9D23CFC9e9fa2B` |
+| **StudioNet deployed address** | `0x34263ab3e2381F6C06CE3e88199aa397E786f51B` |
 | **Network** | GenLayer **StudioNet** (chain id `61999` / `0xF22F`, gasless) |
 | **Runner** | pinned `py-genlayer` intelligent-contract runner |
 | **RPC** | `https://studio.genlayer.com/api` |

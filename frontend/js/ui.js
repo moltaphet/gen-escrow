@@ -4,7 +4,7 @@
 
 import * as C from "./contract.js";
 import {
-  disputeBadge, disputeRecords, disputeCapabilities, formatCountdown,
+  disputeBadge, disputeRecords, disputeCapabilities, canOpenDispute, formatCountdown,
   ROLE_BUYER, ROLE_SELLER,
 } from "./dispute-view.js";
 
@@ -243,7 +243,11 @@ export function renderModalActions(esc, currentAccount, handlers) {
     if (isBuyer && esc.status === "FUNDED") {
       addBtn("Refund Myself", "btn--ghost", () => handlers.refund(esc.id));
     }
-    addBtn("Raise Dispute", "btn--warn", () => handlers.raiseDispute(esc.id));
+    // Only the two counterparties may open a dispute; the contract rejects
+    // anyone else, so an observer is not offered the action at all.
+    if (canOpenDispute(esc, currentAccount)) {
+      addBtn("Raise Dispute", "btn--warn", () => handlers.raiseDispute(esc.id));
+    }
   }
 
   if (esc.status === "DISPUTED") {

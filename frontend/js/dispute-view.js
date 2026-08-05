@@ -4,7 +4,7 @@
    Deliberately dependency-free (no DOM, no SDK, no imports) so the
    per-role rules below can be unit tested directly:
 
-       node --test frontend/test/
+       cd frontend && npm test
 
    Everything here is derived from the `get_escrow` payload, which carries
    the contract's own response-window state (dispute_response_phase,
@@ -130,6 +130,19 @@ export function disputeRecords(esc, account) {
       esc?.seller_dispute_at,
     ),
   ];
+}
+
+/**
+ * Whether the connected wallet may OPEN a dispute on this escrow.
+ *
+ * The contract restricts raise_dispute() to the buyer and the seller, and only
+ * from FUNDED / DELIVERY_SUBMITTED. Mirrored here so an observer is never shown
+ * a "Raise Dispute" button that would revert on-chain.
+ */
+export function canOpenDispute(esc, account) {
+  const role = partyRole(esc, account);
+  const isParty = role === ROLE_BUYER || role === ROLE_SELLER;
+  return isParty && (esc?.status === "FUNDED" || esc?.status === "DELIVERY_SUBMITTED");
 }
 
 /**

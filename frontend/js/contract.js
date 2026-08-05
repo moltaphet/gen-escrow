@@ -7,7 +7,7 @@ import { STATE, NETWORK } from "./wallet.js";
 export const RPC_URL = "https://studio.genlayer.com/api";
 
 // Deployed GenEscrow contract on GenLayer StudioNet.
-export const CONTRACT_ADDRESS = "0x4588A9A9F87500961260885F9C9D23CFC9e9fa2B";
+export const CONTRACT_ADDRESS = "0x34263ab3e2381F6C06CE3e88199aa397E786f51B";
 
 let GL = null;
 let CHAINS = null;
