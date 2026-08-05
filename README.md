@@ -44,13 +44,23 @@ FUNDED ─▶ DELIVERY_SUBMITTED   (seller records deliverables for buyer review
        ─▶ DISPUTED ─▶ RESOLVED (AI consensus decides winner / split)
 ```
 
+`DISPUTED ─▶ RESOLVED` is gated by the **dispute response window**: the counterparty holds a
+guaranteed 48h slot to file its own statement, and resolution stays locked until both parties
+have filed, the silent party waives its reply, or the window lapses.
+
+```
+DISPUTED ──┬─ both parties filed ─────────────┐
+           ├─ non-responding party waives ────┼─▶ resolve_dispute() unlocked ─▶ RESOLVED
+           └─ 48h window elapses ─────────────┘
+```
+
 All monetary values are stored as `u256` in **atto** units (`value × 10^18`).
 
 ---
 
 ## 🏗️ Architecture & Security Fixes (Addressing Reviewer Feedback)
 
-The three findings raised in review have been fixed at the contract level and locked in with dedicated regression tests (the four **GenSkills** benchmarks).
+Every finding raised in review has been fixed at the contract level and locked in with dedicated regression tests (the four **GenSkills** benchmarks plus the response-window suite).
 
 ### 1. Objective Inspection Deadline Enforcement (time-locked)
 
@@ -73,7 +83,28 @@ Previously either party could overwrite the active dispute record. Buyer and sel
 
 > 🔒 Guarded by GenSkill #2 (Evidence Attribution & Anti-Overwrite) and GenSkill #3 (State Guard & Dispute Race Resistance).
 
-### 3. Non-Deterministic Web Render & Consensus Engine
+### 3. Dispute Response Window (no one-sided finalization)
+
+Separate records were not enough on their own: `resolve_dispute()` is permissionless, so whoever filed first could call it in the very next block and have the case judged on a **purely one-sided record** before the counterparty could answer. Resolution is now gated behind an objective response window.
+
+`resolve_dispute()` unlocks only when **one** of these holds:
+
+| Unlock path | Trigger |
+|---|---|
+| **Both records filed** | Buyer *and* seller have each submitted their own statement + evidence |
+| **Explicit waiver** | The non-responding party calls `waive_dispute_response()` to forfeit its reply |
+| **Window elapsed** | 48h (`DISPUTE_RESPONSE_WINDOW_SECONDS`) pass with no reply from the second party |
+
+- Opening a dispute stamps `dispute_raised_ts` and `dispute_response_deadline_ts` from the **consensus transaction clock** (the same deterministic source as the delivery deadline), so the window is objective on-chain state — not a free-text hint.
+- While the window is active, `resolve_dispute()` **reverts for every caller** — initiator, counterparty, owner and validators alike. The gate is on state, not identity.
+- The clock is **fail-closed**: an unavailable time source counts as "window still open", never as expired.
+- `waive_dispute_response()` is callable **only by the party that has not filed**. The initiator cannot waive on the counterparty's behalf — that would recreate the exact shortcut this window closes.
+- The judge is told *why* a record is one-sided (waived vs. lapsed) and is instructed that silence is **not** an admission of fault, so an absent party still cannot be steamrolled.
+- `get_dispute_response_status()` exposes the phase, countdown and `can_resolve` flag for the UI.
+
+> 🔒 Guarded by [`tests/direct/test_dispute_response_window.py`](tests/direct/test_dispute_response_window.py) — 24 tests covering immediate one-sided rejection, the boundary second, all three unlock paths, waiver access control, and both UI roles.
+
+### 4. Non-Deterministic Web Render & Consensus Engine
 
 Evidence is judged by its **actual content**, not a raw (possibly fabricated) URL string:
 
@@ -98,7 +129,7 @@ Evidence is judged by its **actual content**, not a raw (possibly fabricated) UR
 
 > The frontend is already configured for this address in [`frontend/js/contract.js`](frontend/js/contract.js).
 
-**Contract surface:** 15 public methods — 5 `@gl.public.view`, 10 `@gl.public.write` (including the payable `create_escrow`). Storage is flat: `TreeMap` indexes + JSON-serialized `Escrow` records (no nested collections), with a pull-payment `claimable` ledger for every payout.
+**Contract surface:** 17 public methods — 6 `@gl.public.view`, 11 `@gl.public.write` (including the payable `create_escrow`). Storage is flat: `TreeMap` indexes + JSON-serialized `Escrow` records (no nested collections), with a pull-payment `claimable` ledger for every payout.
 
 ---
 
@@ -106,14 +137,17 @@ Evidence is judged by its **actual content**, not a raw (possibly fabricated) UR
 
 | Check | Result |
 |-------|--------|
-| **Unit tests** (direct mode) | **61 / 61 passing — 100%** |
+| **Unit tests** (direct mode) | **85 / 85 passing — 100%** |
+| **Frontend unit tests** (Node) | **19 / 19 passing — 100%** |
 | **GenSkills benchmarks** | **4 / 4 passing** (Premature Claim Guard · Evidence Attribution · Dispute Race Resistance · Web Render & LLM Consensus) |
-| **`genvm-lint check`** | clean — `ok: true` (lint 3/3, validate passed, 15 methods) |
+| **`genvm-lint check`** | clean — `ok: true` (lint 3/3, validate passed, 17 methods) |
 | **`genvm-lint typecheck`** (Pyright) | clean — **0 errors, 0 warnings** |
 | **Contract source** | ASCII-only (client schema-fetch safe); schema extraction `ok: true` |
 
-- The **61 unit tests** live in `tests/direct/` and `tests/test_gen_escrow.py`, run leader-only in-memory (milliseconds), and cover every write method, its guard clauses/reverts, access control, and state transitions.
-- The **4 GenSkills** benchmark tests in `tests/test_gen_escrow.py` are the regression guards for the three reviewer fixes above (plus the consensus engine).
+- The **85 unit tests** live in `tests/direct/` and `tests/test_gen_escrow.py`, run leader-only in-memory (milliseconds), and cover every write method, its guard clauses/reverts, access control, and state transitions.
+- **24 of those** are the dispute response window suite (`tests/direct/test_dispute_response_window.py`): immediate one-sided resolution is rejected, the boundary second is held, all three unlock paths work, the waiver's access control holds, and the payload each UI role renders from is asserted for buyer, seller and observer.
+- The **19 frontend tests** (`frontend/test/`) cover the per-role dispute panel logic — badge/countdown formatting, both-records rendering, and which actions each role may take. They run on Node's built-in runner with **no dependencies and no build step**.
+- The **4 GenSkills** benchmark tests in `tests/test_gen_escrow.py` are the regression guards for the reviewer fixes above (plus the consensus engine).
 - **Integration tests** (`tests/integration/`) exercise every write method under **real leader + validator consensus** on StudioNet and verify value actually moves on-chain (payouts settle on transaction **finalization**). These are gated off by default because they mutate the live contract.
 
 ---
@@ -140,11 +174,20 @@ genvm-lint typecheck contracts/genescrow.py    # Pyright type checking
 ### 2. Run the unit tests (fast, offline, no network)
 
 ```bash
-# All 61 direct-mode unit tests
+# All 85 direct-mode unit tests
 pytest tests/direct/ tests/test_gen_escrow.py -v
+
+# Just the dispute response window suite (24 tests)
+pytest tests/direct/test_dispute_response_window.py -v
 
 # Just the 4 GenSkills benchmark tests
 pytest tests/test_gen_escrow.py -v
+```
+
+Frontend unit tests need no install — Node's built-in runner is enough:
+
+```bash
+cd frontend && npm test        # 19 tests, no dependencies
 ```
 
 ### 3. Run integration tests against live StudioNet (real LLM + consensus)
@@ -182,15 +225,20 @@ gen-escrow/
 │   └── genescrow.py            # Intelligent contract (pinned runner, flat storage)
 ├── frontend/
 │   ├── index.html
+│   ├── package.json            # ESM flag + `npm test` (no dependencies)
 │   ├── css/style.css
-│   └── js/
-│       ├── app.js              # Orchestration
-│       ├── contract.js         # genlayer-js read/write layer (CONTRACT_ADDRESS)
-│       ├── wallet.js           # Wallet + network guard
-│       └── ui.js               # Rendering, modal, toasts
+│   ├── js/
+│   │   ├── app.js              # Orchestration
+│   │   ├── contract.js         # genlayer-js read/write layer (CONTRACT_ADDRESS)
+│   │   ├── wallet.js           # Wallet + network guard
+│   │   ├── dispute-view.js     # Pure per-role dispute logic (badges, records, gating)
+│   │   └── ui.js               # Rendering, modal, toasts
+│   └── test/
+│       └── dispute-view.test.js  # 19 dual-role UI tests (node --test)
 ├── tests/
 │   ├── test_gen_escrow.py      # 4 GenSkills benchmark tests
 │   ├── direct/                 # Fast leader-only unit tests
+│   │   └── test_dispute_response_window.py  # 24 response-window tests
 │   └── integration/            # Full consensus + LLM tests (live StudioNet)
 ├── gltest.config.yaml
 ├── pytest.ini

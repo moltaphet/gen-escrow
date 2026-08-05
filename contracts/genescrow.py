@@ -8,6 +8,11 @@ Features:
 - Buyer creates + funds escrow in one payable transaction
 - Mutual or unilateral release by buyer when terms satisfied
 - Either party can raise a dispute with structured reason + evidence
+- Dispute response window: after a dispute is opened the counterparty holds a
+  guaranteed 48h slot to file its OWN statement. AI resolution stays locked
+  until both parties have filed, the silent party explicitly waives its reply,
+  or the window lapses - so no dispute can be judged on a one-sided record
+  while the other side is still entitled to answer.
 - AI-powered (LLM) dispute resolution via GenLayer consensus:
   * Validators independently analyze terms, dispute statements and evidence
   * Equivalence principle ensures validator agreement on winner + split
@@ -58,6 +63,23 @@ VALID_WINNERS = ("BUYER", "SELLER", "SPLIT")
 DEFAULT_INSPECTION_SECONDS = 7 * 24 * 60 * 60   # 7 days
 MIN_INSPECTION_SECONDS = 60 * 60                # 1 hour floor
 MAX_INSPECTION_SECONDS = 365 * 24 * 60 * 60     # 1 year cap
+
+# Dispute response window. When one party opens a dispute the counterparty gets
+# a guaranteed, objective window to file THEIR OWN statement and evidence before
+# the AI judge can be invoked. Without it, whoever disputes first could
+# immediately call the permissionless resolve_dispute() and have the case judged
+# on a purely one-sided record.
+#
+# resolve_dispute() therefore unlocks only when ONE of these is true:
+#   (a) BOTH parties have filed their own attributable record, or
+#   (b) the non-responding party explicitly waived their reply
+#       (waive_dispute_response), or
+#   (c) the response window has elapsed with no reply from the second party.
+#
+# The window is measured in objective UNIX seconds against the consensus
+# transaction clock (_now_ts), the same deterministic source used for the
+# delivery deadline, so it cannot be bypassed by a party's free-text input.
+DISPUTE_RESPONSE_WINDOW_SECONDS = 48 * 60 * 60  # 48 hours
 
 # Prompt-injection defense: every party-supplied or web-rendered string handed
 # to the LLM judge is wrapped in these fences and the model is told that fenced
@@ -357,6 +379,10 @@ class Escrow:
     # statement. ``dispute_raised_by`` records who first opened the dispute.
     dispute_raised_by: Address
     dispute_raised_at: str
+    dispute_raised_ts: u256          # OBJECTIVE dispute open time (UNIX seconds)
+    dispute_response_deadline_ts: u256  # dispute_raised_ts + response window
+    dispute_response_waived_by: Address # non-responding party who waived reply
+    dispute_response_waived_at: str
     buyer_dispute_reason: str
     buyer_dispute_evidence: str
     buyer_dispute_at: str
@@ -406,6 +432,12 @@ def _serialize_escrow(esc: Escrow) -> str:
         "delivery_submitted_at": esc.delivery_submitted_at,
         "dispute_raised_by": str(esc.dispute_raised_by) if esc.dispute_raised_by else "",
         "dispute_raised_at": esc.dispute_raised_at,
+        "dispute_raised_ts": int(esc.dispute_raised_ts),
+        "dispute_response_deadline_ts": int(esc.dispute_response_deadline_ts),
+        "dispute_response_waived_by": (
+            str(esc.dispute_response_waived_by) if esc.dispute_response_waived_by else ""
+        ),
+        "dispute_response_waived_at": esc.dispute_response_waived_at,
         "buyer_dispute_reason": esc.buyer_dispute_reason,
         "buyer_dispute_evidence": esc.buyer_dispute_evidence,
         "buyer_dispute_at": esc.buyer_dispute_at,
@@ -444,6 +476,14 @@ def _deserialize_escrow(data: str) -> Escrow:
         delivery_submitted_at=d.get("delivery_submitted_at", ""),
         dispute_raised_by=Address(d["dispute_raised_by"]) if d.get("dispute_raised_by") else Address(ZERO_ADDRESS_HEX),
         dispute_raised_at=d.get("dispute_raised_at", ""),
+        dispute_raised_ts=u256(d.get("dispute_raised_ts", 0)),
+        dispute_response_deadline_ts=u256(d.get("dispute_response_deadline_ts", 0)),
+        dispute_response_waived_by=(
+            Address(d["dispute_response_waived_by"])
+            if d.get("dispute_response_waived_by")
+            else Address(ZERO_ADDRESS_HEX)
+        ),
+        dispute_response_waived_at=d.get("dispute_response_waived_at", ""),
         buyer_dispute_reason=d.get("buyer_dispute_reason", ""),
         buyer_dispute_evidence=d.get("buyer_dispute_evidence", ""),
         buyer_dispute_at=d.get("buyer_dispute_at", ""),
@@ -457,6 +497,86 @@ def _deserialize_escrow(data: str) -> Escrow:
         released_to_seller_atto=u256(d["released_to_seller_atto"]),
         refunded_to_buyer_atto=u256(d["refunded_to_buyer_atto"]),
     )
+
+
+# ---------------------------------------------------------------------------
+# Dispute response window helpers
+# ---------------------------------------------------------------------------
+def _dispute_response_deadline(esc: "Escrow") -> int:
+    """Objective UNIX second at which the counterparty's reply window closes.
+
+    Returns 0 when no dispute is open. Falls back to deriving the deadline from
+    the ISO ``dispute_raised_at`` stamp so a record written before the window
+    fields existed can still be resolved instead of being stuck forever.
+    """
+    stored = int(esc.dispute_response_deadline_ts)
+    if stored > 0:
+        return stored
+    raised_ts = int(esc.dispute_raised_ts)
+    if raised_ts <= 0:
+        raised_ts = _iso_to_epoch(esc.dispute_raised_at)
+    if raised_ts > 0:
+        return raised_ts + DISPUTE_RESPONSE_WINDOW_SECONDS
+    return 0
+
+
+def _dispute_response_state(esc: "Escrow") -> dict:
+    """Evaluate the three unlock conditions for AI resolution.
+
+    The dispute may only be judged once the record is provably two-sided OR the
+    second party has forfeited that right - either explicitly (waiver) or by
+    letting the objective response window lapse.
+    """
+    buyer_responded = bool(esc.buyer_dispute_at)
+    seller_responded = bool(esc.seller_dispute_at)
+    both_responded = buyer_responded and seller_responded
+    waived = not _is_zero_address(esc.dispute_response_waived_by)
+
+    deadline_ts = _dispute_response_deadline(esc)
+    now_ts = _now_ts()
+    # Fail closed: an unavailable clock is treated as "window still open" so a
+    # broken time source can never unlock a one-sided judgment.
+    expired = now_ts >= 0 and deadline_ts > 0 and now_ts >= deadline_ts
+
+    seconds_remaining = 0
+    if deadline_ts > 0 and now_ts >= 0 and now_ts < deadline_ts:
+        seconds_remaining = deadline_ts - now_ts
+
+    if both_responded:
+        awaiting_party = ""
+    elif buyer_responded:
+        awaiting_party = "SELLER"
+    elif seller_responded:
+        awaiting_party = "BUYER"
+    else:
+        awaiting_party = ""
+
+    can_resolve = both_responded or waived or expired
+
+    if both_responded:
+        phase = "BOTH_SUBMITTED"
+    elif waived:
+        phase = "RESPONSE_WAIVED"
+    elif expired:
+        phase = "WINDOW_EXPIRED"
+    elif awaiting_party:
+        phase = "AWAITING_RESPONSE"
+    else:
+        phase = "NONE"
+
+    return {
+        "buyer_responded": buyer_responded,
+        "seller_responded": seller_responded,
+        "both_responded": both_responded,
+        "awaiting_party": awaiting_party,
+        "waived": waived,
+        "waived_by": str(esc.dispute_response_waived_by) if waived else "",
+        "deadline_ts": deadline_ts,
+        "expired": expired,
+        "seconds_remaining": seconds_remaining,
+        "can_resolve": can_resolve,
+        "phase": phase,
+    }
 
 
 # ===========================================================================
@@ -544,6 +664,7 @@ class GenEscrow(gl.Contract):
     @gl.public.view
     def get_escrow(self, escrow_id: int) -> dict:
         esc = self._require_escrow(escrow_id)
+        resp = _dispute_response_state(esc)
         # Return plain dict for easy JS consumption
         return {
             "id": int(esc.id),
@@ -565,6 +686,21 @@ class GenEscrow(gl.Contract):
             "delivery_submitted_at": esc.delivery_submitted_at,
             "dispute_raised_by": str(esc.dispute_raised_by) if esc.dispute_raised_by else "",
             "dispute_raised_at": esc.dispute_raised_at,
+            # Dispute response window: everything the UI needs to render the
+            # counter-evidence timer / status badge and to decide whether the
+            # "Resolve with AI" action should be offered at all.
+            "dispute_raised_ts": int(esc.dispute_raised_ts),
+            "dispute_response_deadline_ts": resp["deadline_ts"],
+            "dispute_response_seconds_remaining": resp["seconds_remaining"],
+            "dispute_response_window_expired": resp["expired"],
+            "dispute_response_waived": resp["waived"],
+            "dispute_response_waived_by": resp["waived_by"],
+            "dispute_response_waived_at": esc.dispute_response_waived_at,
+            "dispute_response_phase": resp["phase"],
+            "dispute_awaiting_party": resp["awaiting_party"],
+            "buyer_responded": resp["buyer_responded"],
+            "seller_responded": resp["seller_responded"],
+            "can_resolve": esc.status == STATUS_DISPUTED and resp["can_resolve"],
             # Distinct, attributable dispute records (buyer vs seller).
             "buyer_dispute_reason": esc.buyer_dispute_reason,
             "buyer_dispute_evidence": esc.buyer_dispute_evidence,
@@ -728,6 +864,10 @@ class GenEscrow(gl.Contract):
             delivery_submitted_at="",
             dispute_raised_by=Address(ZERO_ADDRESS_HEX),
             dispute_raised_at="",
+            dispute_raised_ts=u256(0),
+            dispute_response_deadline_ts=u256(0),
+            dispute_response_waived_by=Address(ZERO_ADDRESS_HEX),
+            dispute_response_waived_at="",
             buyer_dispute_reason="",
             buyer_dispute_evidence="",
             buyer_dispute_at="",
@@ -901,13 +1041,95 @@ class GenEscrow(gl.Contract):
             esc.seller_dispute_at = now
 
         # First caller opens the dispute; subsequent counterparty statement keeps
-        # the original initiator attribution.
+        # the original initiator attribution. Opening the dispute also starts the
+        # counterparty's objective response window - until it closes (or both
+        # records exist, or it is waived) resolve_dispute() stays locked, so the
+        # initiator cannot have the case judged on their statement alone.
         if esc.status != STATUS_DISPUTED:
             esc.status = STATUS_DISPUTED
             esc.dispute_raised_by = sender
             esc.dispute_raised_at = now
+            opened_ts = _now_ts()
+            if opened_ts < 0:
+                opened_ts = 0
+            esc.dispute_raised_ts = u256(opened_ts)
+            esc.dispute_response_deadline_ts = u256(
+                opened_ts + DISPUTE_RESPONSE_WINDOW_SECONDS
+            )
 
         self.escrows[u256(escrow_id)] = _serialize_escrow(esc)
+
+    # ------------------------------------------------------------------
+    # Write: Non-responding party waives their reply
+    # ------------------------------------------------------------------
+    @gl.public.write
+    def waive_dispute_response(self, escrow_id: int) -> None:
+        """Let the party who has NOT filed a statement forfeit their reply.
+
+        This is the explicit escape hatch from the response window: a
+        counterparty who has nothing to add should not have to make everyone
+        wait out the full 48 hours. Only the non-responding party may call it -
+        the initiator cannot waive on the other side's behalf, which is exactly
+        the one-sided shortcut the window exists to prevent.
+
+        Once waived, resolve_dispute() unlocks immediately and the judge sees a
+        record that is one-sided BY THE ABSENT PARTY'S OWN CHOICE.
+        """
+        self._require_not_paused()
+        esc = self._require_escrow(escrow_id)
+
+        sender = gl.message.sender_address
+        is_buyer = sender == esc.buyer
+        is_seller = sender == esc.seller
+        if not (is_buyer or is_seller):
+            raise gl.vm.UserError(
+                f"{ERROR_EXPECTED} Only buyer or seller may waive the dispute response"
+            )
+
+        self._require_status(esc, [STATUS_DISPUTED])
+
+        # A party that already filed has exercised its right to respond; there is
+        # nothing left for it to waive.
+        already_filed = esc.buyer_dispute_at if is_buyer else esc.seller_dispute_at
+        if already_filed:
+            raise gl.vm.UserError(
+                f"{ERROR_EXPECTED} Only the non-responding party may waive the dispute response"
+            )
+
+        if not _is_zero_address(esc.dispute_response_waived_by):
+            raise gl.vm.UserError(
+                f"{ERROR_EXPECTED} Dispute response has already been waived"
+            )
+
+        esc.dispute_response_waived_by = sender
+        esc.dispute_response_waived_at = _now_iso()
+
+        self.escrows[u256(escrow_id)] = _serialize_escrow(esc)
+
+    @gl.public.view
+    def get_dispute_response_status(self, escrow_id: int) -> dict:
+        """Standalone view of the response-window gate (badges, timers, gating).
+
+        Mirrors the ``dispute_*`` fields folded into ``get_escrow`` so a frontend
+        can poll just the gate while a dispute is live.
+        """
+        esc = self._require_escrow(escrow_id)
+        resp = _dispute_response_state(esc)
+        return {
+            "escrow_id": int(esc.id),
+            "status": esc.status,
+            "phase": resp["phase"],
+            "buyer_responded": resp["buyer_responded"],
+            "seller_responded": resp["seller_responded"],
+            "awaiting_party": resp["awaiting_party"],
+            "waived": resp["waived"],
+            "waived_by": resp["waived_by"],
+            "response_deadline_ts": resp["deadline_ts"],
+            "seconds_remaining": resp["seconds_remaining"],
+            "window_expired": resp["expired"],
+            "can_resolve": esc.status == STATUS_DISPUTED and resp["can_resolve"],
+            "window_seconds": DISPUTE_RESPONSE_WINDOW_SECONDS,
+        }
 
     # ------------------------------------------------------------------
     # Non-deterministic: AI dispute resolution
@@ -934,6 +1156,30 @@ class GenEscrow(gl.Contract):
         buyer_dispute_evidence = esc.buyer_dispute_evidence
         seller_dispute_reason = esc.seller_dispute_reason
         seller_dispute_evidence = esc.seller_dispute_evidence
+
+        # Why this record is judgeable: both sides filed, the silent side waived
+        # its reply, or the response window lapsed. The judge is told which,
+        # so an empty side is read as a forfeited reply rather than as evidence.
+        resp = _dispute_response_state(esc)
+        if resp["both_responded"]:
+            response_posture = (
+                "BOTH parties filed their own statement. Weigh the two records "
+                "against each other on the merits."
+            )
+        elif resp["waived"]:
+            response_posture = (
+                "One party EXPLICITLY WAIVED its right to reply, so the record is "
+                "one-sided by that party's own choice. A waiver is not an admission "
+                "of fault: still require the filing party's claims to be supported "
+                "by VERIFIED evidence and the terms."
+            )
+        else:
+            response_posture = (
+                "The response window elapsed with NO reply from one party, so the "
+                "record is one-sided by default. Silence is not an admission of "
+                "fault: still require the filing party's claims to be supported by "
+                "VERIFIED evidence and the terms."
+            )
 
         def build_prompt(
             seller_delivery_block: str,
@@ -964,7 +1210,8 @@ class GenEscrow(gl.Contract):
                 f"RELEASE TERMS / CONDITIONS:\n{_fence(terms)}\n\n"
                 f"SELLER DELIVERY NOTE:\n{_fence(delivery_note)}\n\n"
                 f"{seller_delivery_block}\n\n"
-                f"DISPUTE FIRST OPENED BY: {dispute_raised_by}\n\n"
+                f"DISPUTE FIRST OPENED BY: {dispute_raised_by}\n"
+                f"RESPONSE POSTURE: {response_posture}\n\n"
                 "--- BUYER'S DISPUTE STATEMENT (attributable to the buyer) ---\n"
                 f"BUYER DISPUTE REASON:\n{_fence(buyer_dispute_reason)}\n"
                 f"{buyer_dispute_block}\n\n"
@@ -1050,7 +1297,13 @@ class GenEscrow(gl.Contract):
     def resolve_dispute(self, escrow_id: int) -> dict:
         """
         Permissionless call that triggers AI consensus resolution.
-        Can be called by anyone once a dispute exists (encourages resolution).
+
+        Callable by anyone (validators, the owner, either party) to encourage
+        prompt settlement, but ONLY once the record is fair to judge. See
+        DISPUTE_RESPONSE_WINDOW_SECONDS: the counterparty must have filed their
+        own statement, explicitly waived it, or let the objective window lapse.
+        Until then this reverts, so a party cannot open a dispute and instantly
+        have it decided on their own uncontested evidence.
         """
         self._require_not_paused()
         esc = self._require_escrow(escrow_id)
@@ -1059,6 +1312,18 @@ class GenEscrow(gl.Contract):
 
         if not esc.buyer_dispute_reason and not esc.seller_dispute_reason:
             raise gl.vm.UserError(f"{ERROR_EXPECTED} No dispute to resolve")
+
+        # Gate: block immediate one-sided resolution while the counterparty's
+        # response window is still running.
+        resp = _dispute_response_state(esc)
+        if not resp["can_resolve"]:
+            awaiting = resp["awaiting_party"] or "counterparty"
+            raise gl.vm.UserError(
+                f"{ERROR_EXPECTED} Dispute response window is still open; "
+                f"awaiting {awaiting} counter-evidence "
+                f"({resp['seconds_remaining']}s remaining). Resolution unlocks when "
+                f"both parties have filed, the response is waived, or the window expires"
+            )
 
         judgment = self._judge_dispute(esc)
 

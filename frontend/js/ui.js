@@ -3,6 +3,10 @@
    ============================================================ */
 
 import * as C from "./contract.js";
+import {
+  disputeBadge, disputeRecords, disputeCapabilities, formatCountdown,
+  ROLE_BUYER, ROLE_SELLER,
+} from "./dispute-view.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -55,9 +59,17 @@ export function renderEscrowCard(esc) {
         <span><strong>Seller:</strong> ${shortAddr(esc.seller)}</span>
       </div>
 
-      ${esc.status === "DISPUTED" ? `<div style="margin-top:8px;font-size:12px;color:#e6b45a">⚠︎ Dispute active — needs resolution</div>` : ""}
+      ${renderCardDisputeBadge(esc)}
     </div>
   `;
+}
+
+/** Compact response-window badge on the card, so the grid shows at a glance
+ *  which disputes are still waiting on counter-evidence. */
+function renderCardDisputeBadge(esc) {
+  const badge = disputeBadge(esc);
+  if (!badge) return "";
+  return `<div class="card-respwin card-respwin--${badge.tone}">${escapeHtml(badge.label)}</div>`;
 }
 
 /* ---------- Full modal content ---------- */
@@ -111,13 +123,7 @@ export function renderEscrowModal(esc, currentAccount) {
   }
 
   if (esc.status === "DISPUTED" || esc.status === "RESOLVED") {
-    html += `
-      <div class="modal__row">
-        <div class="modal__label">Dispute</div>
-        <div class="modal__value"><strong>Reason:</strong> ${escapeHtml(esc.dispute_reason) || "—"}</div>
-        ${esc.dispute_evidence ? `<div style="margin-top:6px"><strong>Evidence:</strong><br>${escapeHtml(esc.dispute_evidence)}</div>` : ""}
-      </div>
-    `;
+    html += renderDisputePanel(esc, currentAccount);
   }
 
   if (esc.status === "RESOLVED" || esc.status === "COMPLETED" || esc.status === "EXPIRED") {
@@ -133,6 +139,76 @@ export function renderEscrowModal(esc, currentAccount) {
   }
 
   return html;
+}
+
+/* ---------- Dispute panel: both records + response window ---------- */
+
+/** One party's attributable statement + evidence. */
+function renderDisputeRecord(rec) {
+  const mine = rec.isYou
+    ? `<span class="record__you">You</span>`
+    : "";
+  const awaiting = rec.awaiting
+    ? `<span class="record__awaiting">Awaiting response</span>`
+    : "";
+
+  // An unfiled record is shown explicitly rather than hidden, so each side can
+  // see at a glance that the other has not gone on the record yet.
+  const body = rec.filed
+    ? `
+      <div class="record__statement">${escapeHtml(rec.statement) || "—"}</div>
+      ${rec.evidence
+        ? `<div class="record__evidence"><strong>Evidence:</strong><br>${escapeHtml(rec.evidence)}</div>`
+        : `<div class="record__empty">No evidence links provided.</div>`}
+      ${rec.filedAt ? `<div class="record__meta">Filed ${escapeHtml(rec.filedAt)}</div>` : ""}
+    `
+    : `<div class="record__empty">No statement filed by this party yet.</div>`;
+
+  return `
+    <div class="record ${rec.filed ? "record--filed" : "record--empty"}${rec.isYou ? " record--mine" : ""}">
+      <div class="record__head">
+        <span class="record__label">${escapeHtml(rec.label)}</span>
+        ${mine}${awaiting}
+      </div>
+      ${body}
+    </div>
+  `;
+}
+
+export function renderDisputePanel(esc, currentAccount) {
+  const badge = disputeBadge(esc);
+  const records = disputeRecords(esc, currentAccount);
+  const caps = disputeCapabilities(esc, currentAccount);
+
+  const badgeHtml = badge
+    ? `
+      <div class="respwin respwin--${badge.tone}">
+        <div class="respwin__label">${escapeHtml(badge.label)}</div>
+        ${badge.detail ? `<div class="respwin__detail">${escapeHtml(badge.detail)}</div>` : ""}
+      </div>
+    `
+    : "";
+
+  // Tell a connected party where they stand, without offering an action the
+  // contract would reject.
+  let ownNotice = "";
+  if (esc.status === "DISPUTED" && caps.isParty) {
+    const side = caps.role === ROLE_BUYER ? "buyer" : "seller";
+    ownNotice = caps.myRecordFiled
+      ? `<div class="respwin__note">Your ${side} statement is on the record. It is write-once and cannot be edited or overwritten.</div>`
+      : `<div class="respwin__note">You have not filed your ${side} statement yet. You can only submit your own record.</div>`;
+  }
+
+  return `
+    <div class="modal__row">
+      <div class="modal__label">Dispute — both parties' records</div>
+      ${badgeHtml}
+      <div class="records">
+        ${records.map(renderDisputeRecord).join("")}
+      </div>
+      ${ownNotice}
+    </div>
+  `;
 }
 
 /* ---------- Action buttons in modal ---------- */
@@ -171,9 +247,32 @@ export function renderModalActions(esc, currentAccount, handlers) {
   }
 
   if (esc.status === "DISPUTED") {
-    addBtn("Resolve with AI", "btn--primary", () => handlers.resolve(esc.id));
-    if (isBuyer || isSeller) {
-      addBtn("Add Evidence", "btn--ghost", () => handlers.addEvidence(esc.id));
+    const caps = disputeCapabilities(esc, currentAccount);
+
+    // Submit is offered only to the connected party, and only for their own,
+    // not-yet-filed record. A party whose statement is already on chain gets no
+    // edit action at all — records are write-once.
+    if (caps.canFileStatement) {
+      const side = caps.role === ROLE_BUYER ? "Buyer" : "Seller";
+      addBtn(`Submit My ${side} Statement`, "btn--warn", () =>
+        handlers.submitMyStatement(esc.id, caps.role));
+    }
+
+    // The silent party can forfeit the wait instead of stalling the dispute.
+    if (caps.canWaiveResponse) {
+      addBtn("Waive My Response", "btn--ghost", () => handlers.waiveResponse(esc.id));
+    }
+
+    // Resolution stays visibly disabled until the window unlocks, with the
+    // reason surfaced rather than letting the user trigger a revert.
+    if (caps.canResolve) {
+      addBtn("Resolve with AI", "btn--primary", () => handlers.resolve(esc.id));
+    } else {
+      addBtn("Resolve with AI", "btn--primary", () => {}, true);
+      const why = document.createElement("div");
+      why.className = "actions__note";
+      why.textContent = caps.resolveBlockedReason;
+      container.appendChild(why);
     }
   }
 

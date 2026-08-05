@@ -225,6 +225,11 @@ def test_genskill_4_nondet_web_render_and_llm_consensus(
     )
     direct_vm.sender = direct_alice
     contract.raise_dispute(eid, "I do not think the files were actually delivered", "")
+    # The seller forfeits its reply, which unlocks AI resolution immediately
+    # instead of waiting out the 48h counter-evidence window. Window enforcement
+    # itself is covered in tests/direct/test_dispute_response_window.py.
+    direct_vm.sender = direct_bob
+    contract.waive_dispute_response(eid)
 
     # The live page renders to this body inside the non-deterministic block.
     direct_vm.mock_web(

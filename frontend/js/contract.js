@@ -156,6 +156,19 @@ export async function getMyEscrows(account, role = "all") {
   return escrows.sort((a, b) => Number(b.id) - Number(a.id));
 }
 
+// Live view of the dispute response window (phase, countdown, whether the
+// dispute may be resolved yet). Useful for refreshing just the timer while a
+// dispute is open, without re-reading the whole escrow.
+export async function getDisputeResponseStatus(id) {
+  const client = getReadClient();
+  const res = await client.readContract({
+    address: CONTRACT_ADDRESS,
+    functionName: "get_dispute_response_status",
+    kwargs: { escrow_id: Number(id) },
+  });
+  return asObj(res);
+}
+
 export async function getClaimable(account) {
   const client = getReadClient();
   const val = await client.readContract({
@@ -215,6 +228,14 @@ export async function raiseDispute(escrowId, reason, evidence) {
     reason,
     evidence: evidence || "",
   });
+}
+
+// Forfeit the connected party's counter-evidence slot so the dispute can be
+// resolved without waiting out the full 48h response window. The contract
+// allows this only from the party that has NOT filed a statement.
+export async function waiveDisputeResponse(escrowId) {
+  const client = getWriteClient();
+  return submitWrite(client, "waive_dispute_response", { escrow_id: Number(escrowId) });
 }
 
 export async function resolveDispute(escrowId) {

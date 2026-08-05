@@ -157,19 +157,42 @@ function openEscrowDetail(esc) {
         UI.showToast("Resolution failed: " + (err.message || err), "err");
       }
     },
-    addEvidence: async (id) => {
-      const extra = prompt("Additional evidence / notes:");
-      if (!extra) return;
-      // Simple re-raise with appended evidence (contract allows updating reason)
+    // File the CONNECTED party's own counter-statement. Each side owns a
+    // separate, write-once record on chain, so this only ever submits the
+    // caller's own text — it never reads or re-sends the counterparty's record.
+    submitMyStatement: async (id, role) => {
+      const side = role === "BUYER" ? "buyer" : "seller";
+      const reason = prompt(
+        `Your ${side} statement — describe your side of the dispute (min 10 characters):`
+      );
+      if (!reason) return;
+      const evidence = prompt("Your evidence links (optional, one per line):", "") || "";
+      if (!canWrite()) return alert("Connect wallet and switch to StudioNet");
       try {
-        const current = await C.getEscrow(id);
-        const combined = (current.dispute_evidence || "") + "\n" + extra;
-        await C.raiseDispute(id, current.dispute_reason || "Updated evidence", combined);
-        UI.showToast("Evidence added.", "ok");
+        UI.showToast("Filing your statement...", "ok");
+        await C.raiseDispute(id, reason, evidence);
+        UI.showToast("Your statement is on the record. Refreshing...", "ok");
         UI.closeModal();
         await refreshAll();
       } catch (err) {
-        UI.showToast("Failed: " + (err.message || err), "err");
+        UI.showToast("Submission failed: " + (err.message || err), "err");
+      }
+    },
+    waiveResponse: async (id) => {
+      if (!confirm(
+        "Waive your response?\n\nYou are giving up your slot to file a counter-statement, " +
+        "and the dispute becomes resolvable immediately instead of after the 48h window. " +
+        "This cannot be undone."
+      )) return;
+      if (!canWrite()) return alert("Connect wallet and switch to StudioNet");
+      try {
+        UI.showToast("Waiving your response...", "ok");
+        await C.waiveDisputeResponse(id);
+        UI.showToast("Response waived. Refreshing...", "ok");
+        UI.closeModal();
+        await refreshAll();
+      } catch (err) {
+        UI.showToast("Waiver failed: " + (err.message || err), "err");
       }
     },
     claimAfterDeadline: async (id) => {

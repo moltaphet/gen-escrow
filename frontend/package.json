@@ -1,0 +1,10 @@
+{
+  "name": "gen-escrow-frontend",
+  "private": true,
+  "version": "1.0.0",
+  "description": "GenEscrow static frontend. No build step and no dependencies - index.html loads js/ directly as ES modules. This manifest exists so Node treats those same modules as ESM when running the unit tests.",
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  }
+}
